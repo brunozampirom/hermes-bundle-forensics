@@ -32,6 +32,9 @@ const Args = struct {
     top: u32 = 10,
     entry: ?[]const u8 = null,
     list: bool = false,
+    /// When set, the run is a diff of path -> path_b.
+    path_b: ?[]const u8 = null,
+    entry_b: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -49,21 +52,68 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    const loaded = load(arena, io, out, args) catch |err| switch (err) {
+    const a = try open(arena, io, out, args, args.path, args.entry);
+    if (args.list) {
+        try out.flush();
+        return;
+    }
+
+    if (args.path_b) |pb| {
+        const b = try open(arena, io, out, args, pb, args.entry_b);
+        try reportDiff(out, arena, a, b, args.top);
+    } else {
+        try report(out, a, args.top);
+    }
+    try out.flush();
+}
+
+const Loaded = struct {
+    bytes: []u8,
+    /// What to print as the source: the plain path, or `container!entry`.
+    label: []const u8,
+};
+
+/// One parsed bundle, everything both the single-file report and the diff need.
+const Bundle = struct {
+    label: []const u8,
+    bytes: []u8,
+    header: hbc.Header,
+    functions: []hbc.Function,
+    table: ?strings.Table,
+};
+
+/// Loads and parses one bundle, or writes a specific error and exits.
+fn open(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    args: Args,
+    path: []const u8,
+    entry: ?[]const u8,
+) !Bundle {
+    var one = args;
+    one.path = path;
+    one.entry = entry;
+
+    const loaded = load(arena, io, out, one) catch |err| switch (err) {
         error.Reported => {
             try out.flush();
             std.process.exit(1);
         },
         else => {
-            try out.print("error: could not read {s}: {s}\n", .{ args.path, @errorName(err) });
+            try out.print("error: could not read {s}: {s}\n", .{ path, @errorName(err) });
             try out.flush();
             std.process.exit(1);
         },
     };
-    if (args.list) {
-        try out.flush();
-        return;
-    }
+    if (args.list) return .{
+        .label = loaded.label,
+        .bytes = loaded.bytes,
+        .header = undefined,
+        .functions = &.{},
+        .table = null,
+    };
+
     const bytes = loaded.bytes;
     const label = loaded.label;
 
@@ -77,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     // would produce a section map with percentages above 100%, which is worse
     // than not answering.
     if (bytes.len < h.file_length) {
-        try reportIdentity(out, args.path, bytes.len, h);
+        try reportIdentity(out, label, bytes.len, h);
         try out.print(
             "\nerror: truncated — header declares {d} bytes, {d} missing\n",
             .{ h.file_length, h.file_length - bytes.len },
@@ -87,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const functions = hbc.parseFunctions(arena, bytes, h) catch |err| {
-        try reportIdentity(out, args.path, bytes.len, h);
+        try reportIdentity(out, label, bytes.len, h);
         try out.print("\nerror: bad function header table: {s}\n", .{@errorName(err)});
         try out.flush();
         std.process.exit(1);
@@ -97,15 +147,14 @@ pub fn main(init: std.process.Init) !void {
     // on — the caller loses names, not the whole analysis.
     const table: ?strings.Table = strings.Table.init(bytes, h) catch null;
 
-    try report(out, label, bytes.len, h, functions, table, args.top);
-    try out.flush();
+    return .{
+        .label = label,
+        .bytes = bytes,
+        .header = h,
+        .functions = functions,
+        .table = table,
+    };
 }
-
-const Loaded = struct {
-    bytes: []u8,
-    /// What to print as the source: the plain path, or `container!entry`.
-    label: []const u8,
-};
 
 /// Signals that a specific, useful message has already been written, so the
 /// caller should exit rather than print a generic error on top of it.
@@ -193,7 +242,9 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
     var path: ?[]const u8 = null;
     var top: u32 = 10;
     var entry: ?[]const u8 = null;
+    var entry_b: ?[]const u8 = null;
     var list = false;
+    var path_b: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -206,17 +257,31 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
             i += 1;
             if (i >= argv.len) return null;
             entry = argv[i];
+        } else if (std.mem.eql(u8, a, "--entry-b")) {
+            i += 1;
+            if (i >= argv.len) return null;
+            entry_b = argv[i];
         } else if (std.mem.eql(u8, a, "--list")) {
             list = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
             return null;
         } else {
-            if (path != null) return null;
-            path = a;
+            if (path == null) {
+                path = a;
+            } else if (path_b == null) {
+                path_b = a;
+            } else return null;
         }
     }
 
-    return .{ .path = path orelse return null, .top = top, .entry = entry, .list = list };
+    return .{
+        .path = path orelse return null,
+        .top = top,
+        .entry = entry,
+        .list = list,
+        .path_b = path_b,
+        .entry_b = entry_b,
+    };
 }
 
 fn reportParseError(
@@ -278,16 +343,175 @@ fn reportIdentity(out: *Io.Writer, path: []const u8, file_size: usize, h: hbc.He
     });
 }
 
-fn report(
+fn printDelta(out: *Io.Writer, name: []const u8, a: u64, b: u64) !void {
+    const grew = b >= a;
+    const delta = if (grew) b - a else a - b;
+    try out.print("  {s:<24} {d:>12} {d:>12}   {s}{d}\n", .{
+        name, a, b, if (delta == 0) " " else if (grew) "+" else "-", delta,
+    });
+}
+
+/// Diffing two bundles of the same app is the question people actually ask:
+/// not "how big is this" but "what grew". Sections and counts line up exactly.
+/// Functions are matched by name, which only works for names that are unique
+/// in both bundles — the report says how many it could not match rather than
+/// pretending the rest vanished.
+fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top: u32) !void {
+    try out.print("a  {s}\n", .{a.label});
+    try out.print("b  {s}\n", .{b.label});
+
+    if (std.mem.eql(u8, &a.header.source_hash, &b.header.source_hash)) {
+        try out.print("\nsame source hash — these were built from identical sources\n", .{});
+    }
+
+    try out.print("\n{s:<26} {s:>12} {s:>12}   {s}\n", .{ "", "a", "b", "delta" });
+    try printDelta(out, "total size", a.bytes.len, b.bytes.len);
+
+    const a_by_offset = try gpa.dupe(hbc.Function, a.functions);
+    defer gpa.free(a_by_offset);
+    const b_by_offset = try gpa.dupe(hbc.Function, b.functions);
+    defer gpa.free(b_by_offset);
+    const a_stats = hbc.bytecodeStats(a_by_offset);
+    const b_stats = hbc.bytecodeStats(b_by_offset);
+
+    try out.print("\nsections\n", .{});
+    var abuf: [hbc.SECTION_COUNT]hbc.Section = undefined;
+    var bbuf: [hbc.SECTION_COUNT]hbc.Section = undefined;
+    const asecs = hbc.sections(a.header, a_stats.distinct_bytes, &abuf);
+    const bsecs = hbc.sections(b.header, b_stats.distinct_bytes, &bbuf);
+    var a_known: u64 = 0;
+    var b_known: u64 = 0;
+    for (asecs, bsecs) |sa, sb| {
+        a_known += sa.bytes;
+        b_known += sb.bytes;
+        if (sa.bytes == 0 and sb.bytes == 0) continue;
+        try printDelta(out, sa.name, sa.bytes, sb.bytes);
+    }
+    // Without this the deltas quietly fail to add up to the total.
+    try printDelta(
+        out,
+        "rest (info + padding)",
+        if (a.bytes.len > a_known) a.bytes.len - a_known else 0,
+        if (b.bytes.len > b_known) b.bytes.len - b_known else 0,
+    );
+
+    try out.print("\ncounts\n", .{});
+    try printDelta(out, "functions", a.header.function_count, b.header.function_count);
+    try printDelta(out, "distinct bodies", a_stats.distinct_bodies, b_stats.distinct_bodies);
+    try printDelta(out, "strings", a.header.string_count, b.header.string_count);
+    try printDelta(out, "regexps", a.header.regexp_count, b.header.regexp_count);
+
+    if (top == 0) return;
+    if (a.table == null or b.table == null) return;
+    try reportStringDiff(out, gpa, a.table.?, b.table.?);
+    try reportFunctionDiff(out, gpa, a, b, top);
+}
+
+/// Strings are content-addressable, so they diff exactly: no matching
+/// heuristic, no ambiguity.
+fn reportStringDiff(out: *Io.Writer, gpa: std.mem.Allocator, ta: strings.Table, tb: strings.Table) !void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+
+    var id: u32 = 0;
+    while (id < ta.count) : (id += 1) {
+        const s = ta.get(id) catch continue;
+        try seen.put(gpa, s.bytes, {});
+    }
+
+    var added: u32 = 0;
+    var added_bytes: u64 = 0;
+    id = 0;
+    while (id < tb.count) : (id += 1) {
+        const s = tb.get(id) catch continue;
+        if (!seen.contains(s.bytes)) {
+            added += 1;
+            added_bytes += s.bytes.len;
+        }
+    }
+
+    try out.print("\nstrings only in b\n", .{});
+    try out.print("  {d} strings, {d} bytes\n", .{ added, added_bytes });
+}
+
+const NameSize = struct { size: u64, count: u32 };
+
+fn reportFunctionDiff(
     out: *Io.Writer,
-    path: []const u8,
-    file_size: usize,
-    h: hbc.Header,
-    functions: []hbc.Function,
-    table: ?strings.Table,
+    gpa: std.mem.Allocator,
+    a: Bundle,
+    b: Bundle,
     top: u32,
 ) !void {
-    try reportIdentity(out, path, file_size, h);
+    var map: std.StringHashMapUnmanaged(NameSize) = .empty;
+    defer map.deinit(gpa);
+
+    for (a.functions) |f| {
+        const name = (a.table.?.get(f.name_id) catch continue).bytes;
+        if (name.len == 0) continue;
+        const e = try map.getOrPut(gpa, name);
+        if (e.found_existing) {
+            e.value_ptr.count += 1;
+        } else {
+            e.value_ptr.* = .{ .size = f.bytecode_size, .count = 1 };
+        }
+    }
+
+    const Change = struct { name: []const u8, before: u64, after: u64 };
+    var changes: std.ArrayList(Change) = .empty;
+    defer changes.deinit(gpa);
+
+    var ambiguous: u32 = 0;
+    var unmatched: u32 = 0;
+
+    for (b.functions) |f| {
+        const name = (b.table.?.get(f.name_id) catch continue).bytes;
+        if (name.len == 0) continue;
+        const hit = map.get(name) orelse {
+            unmatched += 1;
+            continue;
+        };
+        if (hit.count > 1) {
+            ambiguous += 1;
+            continue;
+        }
+        if (hit.size == f.bytecode_size) continue;
+        try changes.append(gpa, .{ .name = name, .before = hit.size, .after = f.bytecode_size });
+    }
+
+    if (changes.items.len == 0) {
+        try out.print("\nno uniquely-named function changed size\n", .{});
+    } else {
+        std.sort.pdq(Change, changes.items, {}, struct {
+            fn f(_: void, x: Change, y: Change) bool {
+                const dx = if (x.after > x.before) x.after - x.before else x.before - x.after;
+                const dy = if (y.after > y.before) y.after - y.before else y.before - y.after;
+                return dx > dy;
+            }
+        }.f);
+
+        const n = @min(@as(usize, top), changes.items.len);
+        try out.print("\ntop {d} functions by size change (matched by name)\n", .{n});
+        for (changes.items[0..n]) |c| {
+            const grew = c.after >= c.before;
+            const d = if (grew) c.after - c.before else c.before - c.after;
+            try out.print("  {s}{d:<9} {d:>8} -> {d:<8}  {s}\n", .{
+                if (grew) "+" else "-", d, c.before, c.after, c.name,
+            });
+        }
+    }
+
+    try out.print("\n  {d} names appear more than once in a and were skipped\n", .{ambiguous});
+    try out.print("  {d} named functions in b have no counterpart in a\n", .{unmatched});
+}
+
+fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
+    const h = b.header;
+    const file_size = b.bytes.len;
+    const functions = b.functions;
+    const table = b.table;
+
+    try reportIdentity(out, b.label, file_size, h);
 
     // fileLength covers through the end of the footer, so a file larger than
     // declared is just padding or concatenation — note it and move on.
