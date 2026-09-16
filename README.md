@@ -11,9 +11,25 @@ one build:
 ```
 
 The iOS bundle is 1.93 MB larger than the Android one, and **1.72 MB of that is
-Hermes debug info the release build never stripped**. Metro reports one bundle
-size per platform and stops there; nothing in the JS toolchain points at the
-line above.
+Hermes debug info the release build kept**. Metro reports one bundle size per
+platform and stops there; nothing in the JS toolchain points at the line above.
+
+The cause is a default that differs by platform. `-output-source-map` moves the
+debug info out of the bundle and into the `.map`, and React Native passes it on
+one platform but not the other:
+
+| | flag | debug info in the shipped bundle |
+|---|---|---|
+| Android, `ReactExtension.kt` | `["-O", "-output-source-map"]`, always | 28 bytes |
+| iOS, `react-native-xcode.sh` | `-output-source-map` only when `SOURCEMAP_FILE` is set | everything |
+
+Compiling one file both ways with the same `hermesc` shows the mechanism
+directly: 208 bytes of debug info without the flag, 28 with it, and a `.map`
+alongside.
+
+So the fix is not to strip anything. Set `SOURCEMAP_FILE` in the iOS build and
+you get a source map for symbolication *and* drop the bytes, because Sentry and
+Crashlytics read the `.map`, not the section inside the bundle.
 
 ## What it reports
 
@@ -133,11 +149,35 @@ be a guess.
 
 ## Scope
 
-**Bytecode versions 90-96.** 96 is current for Hermes (`BytecodeVersion.h`) and
-is what React Native ships. Below 90, fields are missing from the header; the
-tool refuses rather than reading garbage.
+**Bytecode versions 90-99**, across the two lines that are actually in the wild.
+
+`facebook/hermes` main tops out at **96**. React Native does not ship that one:
+since Hermes V1 became the default it ships the `static_h` line, which emits
+**98** and up. They disagree about more than a version number:
+
+| | classic (90-96) | `static_h` (97+) |
+|---|---|---|
+| file header | 21 fields | one more, `numStringSwitchImms`, so everything after the object shape table sits four bytes later |
+| third literal section | `objValueBufferSize`, a byte count | `objShapeTableCount`, an entry count of 8 bytes each |
+| function header entry | 16 bytes | 12 bytes; the word holding `infoOffset` is gone |
+| inline function name | 17 bits | **8 bits** |
+| overflow offset | `(infoOffset << 16) \| offset` | `(functionName << 24) \| offset` |
+
+That 8-bit name field has a visible consequence: any function whose name is not
+in the first 256 strings cannot fit inline, so on a real bundle almost every
+header overflows. On the React Native bundle measured below, 6667 of 7482 did,
+and the full size headers they point at are 12.9% of the file. They get their
+own row rather than disappearing into the remainder.
+
+Below 90, fields are missing from the header; the tool refuses rather than
+reading garbage.
 
 **Not supported:** delta-prepped bundles (detected and named, not parsed).
+Diffing across the two lines is refused, since the section tables do not line
+up and a row would be labelled from one side and filled from the other.
+
+To get a 96 bundle out of a recent React Native, build with
+`RCT_HERMES_V1_ENABLED=0`.
 
 **What it does not do:** attribute bytes back to JS modules. Hermes keeps no
 module boundary in the bytecode, so anything module-level would have to come
@@ -156,9 +196,10 @@ zig build run -- bundle.hbc
 
 ## Where the layout comes from
 
-`include/hermes/BCGen/HBC/BytecodeFileFormat.h` in facebook/hermes, plus
-`BytecodeStream.cpp` for section order and alignment. Section order follows
-`visitBytecodeSegmentsInOrder()`, and each section is preceded by
+`include/hermes/BCGen/HBC/BytecodeFileFormat.h` in facebook/hermes, read on both
+branches: `main` for the classic line and `static_h` for the one React Native
+ships. Plus `BytecodeStream.cpp` for section order and alignment. Section order
+follows `visitBytecodeSegmentsInOrder()`, and each section is preceded by
 `pad(BYTECODE_ALIGNMENT)`, so each starts on the next 4-byte boundary.
 
 Everything is parsed field by field rather than cast from an `extern struct`.
@@ -169,7 +210,9 @@ since the whole point of that range is that the layout is version-dependent.
 Three details in the format are easy to read wrong, and each has its own test:
 
 - A `SmallFuncHeader` that overflows stores the large header's offset split
-  across two of its own fields, as `(infoOffset << 16) | offset`.
+  across two of its own fields: `(infoOffset << 16) | offset` on the classic
+  line, and `(functionName << 24) | offset` on `static_h`, which has no
+  `infoOffset` to borrow.
 - A string entry with `length == 0xFF` is overflowed, and its `offset` field is
   then an **index into the overflow table**, not a byte offset.
 - Summed string lengths exceed the storage buffer on every real bundle. That is
@@ -190,8 +233,10 @@ Three details in the format are easy to read wrong, and each has its own test:
   itself is covered by an end-to-end check that reading from a container gives
   output identical to unzipping first. Building zip fixtures in-process was not
   worth the code.
-- **Validated on one app's real artifacts**, a matching `.aab` and `.ipa`,
-  plus synthetic bundles from `hermesc`. Not yet run across a corpus.
+- **Validated on two apps' real artifacts**: a matching `.aab` and `.ipa` from
+  one build (bytecode 96), and a React Native 0.86.3 release bundle (bytecode
+  98, where debug info came to 16.9%), plus synthetic bundles from `hermesc` on
+  both lines. Not yet run across a corpus.
 
 ## Generating a test bundle
 

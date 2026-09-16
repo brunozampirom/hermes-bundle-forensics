@@ -355,6 +355,20 @@ fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top
     try out.print("a  {s}\n", .{a.label});
     try out.print("b  {s}\n", .{b.label});
 
+    // The two bytecode lines name different sections in the same slots, so a
+    // row would be labelled from one side and filled from the other. Refuse
+    // rather than print a table where the labels only describe column a.
+    const a_fmt = hbc.Format.forVersion(a.header.version);
+    const b_fmt = hbc.Format.forVersion(b.header.version);
+    if (a_fmt != b_fmt) {
+        try out.print(
+            "\nbytecode {d} and {d} are different format lines and their section" ++
+                " tables do not line up; diff bundles from one line\n",
+            .{ a.header.version, b.header.version },
+        );
+        return;
+    }
+
     if (std.mem.eql(u8, &a.header.source_hash, &b.header.source_hash)) {
         try out.print("\nsame source hash; these were built from identical sources\n", .{});
     }
@@ -372,8 +386,8 @@ fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top
     try out.print("\nsections\n", .{});
     var abuf: [hbc.SECTION_COUNT]hbc.Section = undefined;
     var bbuf: [hbc.SECTION_COUNT]hbc.Section = undefined;
-    const asecs = hbc.sections(a.header, a_stats.distinct_bytes, &abuf);
-    const bsecs = hbc.sections(b.header, b_stats.distinct_bytes, &bbuf);
+    const asecs = hbc.sections(a.header, a_stats.distinct_bytes, a_stats.overflowed_headers, &abuf);
+    const bsecs = hbc.sections(b.header, b_stats.distinct_bytes, b_stats.overflowed_headers, &bbuf);
     var a_known: u64 = 0;
     var b_known: u64 = 0;
     for (asecs, bsecs) |sa, sb| {
@@ -573,7 +587,7 @@ fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
 
     try out.print("\nsection map\n", .{});
     var buf: [hbc.SECTION_COUNT]hbc.Section = undefined;
-    const secs = hbc.sections(h, stats.distinct_bytes, &buf);
+    const secs = hbc.sections(h, stats.distinct_bytes, stats.overflowed_headers, &buf);
 
     var known: u64 = 0;
     for (secs) |s| known += s.bytes;

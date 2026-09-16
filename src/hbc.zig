@@ -17,10 +17,50 @@ pub const FOOTER_SIZE: usize = SHA1_NUM_BYTES;
 /// Each section is padded to this before it starts (BytecodeStream.cpp).
 pub const ALIGNMENT: u64 = 4;
 
-/// 96 is current for Hermes and is what React Native ships. Below 90 some
-/// header fields do not exist, so we refuse rather than read garbage.
+/// Two bytecode lines are in the wild and they disagree about the function
+/// header layout.
+///
+/// `facebook/hermes` main tops out at 96. React Native does not ship that one:
+/// since Hermes V1 became the default it ships the `static_h` line, which emits
+/// 98 and up. `RCT_HERMES_V1_ENABLED=0` opts back into the 96 line.
+///
+/// Below 90 some file header fields do not exist, so we refuse rather than read
+/// garbage.
 pub const VERSION_MIN: u32 = 90;
-pub const VERSION_MAX: u32 = 96;
+pub const CLASSIC_VERSION_MAX: u32 = 96;
+pub const VERSION_MAX: u32 = 99;
+
+pub const Format = enum {
+    /// Bytecode 90 to 96, `facebook/hermes` main.
+    classic,
+    /// Bytecode 97 and up, the `static_h` line that React Native ships.
+    static_h,
+
+    pub fn forVersion(version: u32) Format {
+        return if (version <= CLASSIC_VERSION_MAX) .classic else .static_h;
+    }
+
+    /// Entry size in the function header table.
+    pub fn funcHeaderSize(self: Format) u64 {
+        return switch (self) {
+            // Four little-endian words of bitfields.
+            .classic => 16,
+            // Two words plus three bytes plus flags: the third word went away
+            // when `infoOffset` was dropped from the field list.
+            .static_h => 12,
+        };
+    }
+
+    /// Size of the overflow form, same fields at full width.
+    pub fn largeFuncHeaderSize(self: Format) u64 {
+        return switch (self) {
+            // 7 * u32 + 2 * u8 + flags.
+            .classic => 31,
+            // 8 * u32 + 3 * u8 + flags.
+            .static_h => 36,
+        };
+    }
+};
 
 pub const Options = packed struct(u8) {
     static_builtins: bool,
@@ -45,9 +85,16 @@ pub const Header = struct {
     bigint_storage_size: u32,
     regexp_count: u32,
     regexp_storage_size: u32,
+    /// `arrayBufferSize` on the classic line, `literalValueBufferSize` on
+    /// `static_h`. Same slot, and a byte count either way.
     array_buffer_size: u32,
     obj_key_buffer_size: u32,
+    /// `objValueBufferSize`, a byte count, on the classic line.
+    /// `objShapeTableCount`, an entry count, on `static_h`. Use
+    /// `objValueSectionSize` rather than reading this directly.
     obj_value_buffer_size: u32,
+    /// `static_h` only. The classic line has no such field.
+    num_string_switch_imms: u32,
     segment_id: u32,
     cjs_module_count: u32,
     function_source_count: u32,
@@ -121,6 +168,9 @@ pub fn parseHeader(bytes: []const u8) ParseError!Header {
         .array_buffer_size = c.u32le(),
         .obj_key_buffer_size = c.u32le(),
         .obj_value_buffer_size = c.u32le(),
+        // `static_h` inserted a field here and shrank the trailing padding to
+        // keep the header at 128 bytes. Everything after it shifts by 4.
+        .num_string_switch_imms = if (Format.forVersion(version) == .static_h) c.u32le() else 0,
         .segment_id = c.u32le(),
         .cjs_module_count = c.u32le(),
         .function_source_count = c.u32le(),
@@ -128,21 +178,19 @@ pub fn parseHeader(bytes: []const u8) ParseError!Header {
         .options = @bitCast(c.u8v()),
     };
 
-    // 108 bytes of fields plus one for options; the rest up to 128 is padding.
-    std.debug.assert(c.pos == 109);
+    // Fields plus the options byte; the rest up to 128 is padding, which
+    // `static_h` shortened by the four bytes its extra field takes.
+    const fields_end: usize = switch (Format.forVersion(version)) {
+        .classic => 109,
+        .static_h => 113,
+    };
+    std.debug.assert(c.pos == fields_end);
     return h;
 }
 
 // ---------------------------------------------------------------------------
 // Function headers
 // ---------------------------------------------------------------------------
-
-/// Four little-endian words of bitfields, allocated from the least significant
-/// bit as Clang and GCC do on little-endian targets.
-pub const FUNC_HEADER_SIZE: u64 = 16;
-
-/// The overflow form: same fields at full width, packed. 7 * u32 + 3 * u8.
-pub const LARGE_FUNC_HEADER_SIZE: u64 = 31;
 
 pub const FunctionFlags = packed struct(u8) {
     /// Which kinds of call are prohibited (ProhibitCall/Construct/None).
@@ -174,25 +222,91 @@ pub const FunctionError = error{
     BadLargeHeaderOffset,
 };
 
+/// Entries in the `static_h` object shape table; the classic line stores a
+/// byte count in that slot instead.
+pub const SHAPE_TABLE_ENTRY_SIZE: u64 = 8;
+
+/// Bytes held by the third literal section, whichever form it takes.
+pub fn objValueSectionSize(h: Header) u64 {
+    return switch (Format.forVersion(h.version)) {
+        .classic => h.obj_value_buffer_size,
+        .static_h => @as(u64, h.obj_value_buffer_size) * SHAPE_TABLE_ENTRY_SIZE,
+    };
+}
+
 pub fn functionTableSize(h: Header) u64 {
-    return @as(u64, h.function_count) * FUNC_HEADER_SIZE;
+    return @as(u64, h.function_count) * Format.forVersion(h.version).funcHeaderSize();
 }
 
 /// Reads one function header, following the overflow indirection when the
 /// small header could not hold the real values.
-pub fn parseFunction(bytes: []const u8, index: u32) FunctionError!Function {
-    const base = HEADER_SIZE + @as(u64, index) * FUNC_HEADER_SIZE;
-    if (base + FUNC_HEADER_SIZE > bytes.len) return error.TruncatedFunctionTable;
+pub fn parseFunction(bytes: []const u8, h: Header, index: u32) FunctionError!Function {
+    const fmt = Format.forVersion(h.version);
+    const entry = fmt.funcHeaderSize();
+    const base = HEADER_SIZE + @as(u64, index) * entry;
+    if (base + entry > bytes.len) return error.TruncatedFunctionTable;
 
     const at: usize = @intCast(base);
+    var f = switch (fmt) {
+        .classic => parseSmallClassic(bytes, at, index),
+        .static_h => parseSmallStaticH(bytes, at, index),
+    };
+
+    if (!f.flags.overflowed) return f;
+
+    const large_at = largeHeaderOffset(fmt, f);
+    if (large_at + fmt.largeFuncHeaderSize() > bytes.len) return error.BadLargeHeaderOffset;
+
+    var c = Cursor{ .bytes = bytes, .pos = @intCast(large_at) };
+    switch (fmt) {
+        .classic => {
+            f.offset = c.u32le();
+            f.param_count = c.u32le();
+            f.bytecode_size = c.u32le();
+            f.name_id = c.u32le();
+            f.info_offset = c.u32le();
+            f.frame_size = c.u32le();
+            f.environment_size = c.u32le();
+            _ = c.u8v(); // highestReadCacheIndex
+            _ = c.u8v(); // highestWriteCacheIndex
+        },
+        .static_h => {
+            f.offset = c.u32le();
+            f.param_count = c.u32le();
+            _ = c.u32le(); // loopDepth
+            f.bytecode_size = c.u32le();
+            f.name_id = c.u32le();
+            _ = c.u32le(); // numberRegCount
+            _ = c.u32le(); // nonPtrRegCount
+            f.frame_size = c.u32le();
+            _ = c.u8v(); // readCacheSize
+            _ = c.u8v(); // writeCacheSize
+            _ = c.u8v(); // privateNameCacheSize
+        },
+    }
+    f.flags = @bitCast(c.u8v());
+    f.from_large_header = true;
+    return f;
+}
+
+/// Where the large header lives, recovered from the small header fields that
+/// were reused to store it. Classic splits it 16/16 across `infoOffset` and
+/// `offset`. The `static_h` line has no `infoOffset`, so it splits it 24/8
+/// across `offset` and `functionName`.
+fn largeHeaderOffset(fmt: Format, f: Function) u64 {
+    return switch (fmt) {
+        .classic => (@as(u64, f.info_offset) << 16) | @as(u64, f.offset),
+        .static_h => (@as(u64, f.name_id) << 24) | @as(u64, f.offset),
+    };
+}
+
+fn parseSmallClassic(bytes: []const u8, at: usize, index: u32) Function {
     const w0 = std.mem.readInt(u32, bytes[at..][0..4], .little);
     const w1 = std.mem.readInt(u32, bytes[at + 4 ..][0..4], .little);
     const w2 = std.mem.readInt(u32, bytes[at + 8 ..][0..4], .little);
     const w3 = std.mem.readInt(u32, bytes[at + 12 ..][0..4], .little);
 
-    const flags: FunctionFlags = @bitCast(@as(u8, @truncate(w3 >> 24)));
-
-    var f = Function{
+    return .{
         .index = index,
         .offset = w0 & 0x01FF_FFFF, // 25 bits
         .param_count = w0 >> 25, // 7 bits
@@ -201,30 +315,33 @@ pub fn parseFunction(bytes: []const u8, index: u32) FunctionError!Function {
         .info_offset = w2 & 0x01FF_FFFF, // 25 bits
         .frame_size = w2 >> 25, // 7 bits
         .environment_size = w3 & 0xFF,
+        .flags = @bitCast(@as(u8, @truncate(w3 >> 24))),
+        .from_large_header = false,
+    };
+}
+
+/// The `static_h` small header: two words of bitfields, then three bytes, then
+/// flags. `infoOffset` and `environmentSize` no longer exist, and the fields
+/// that took their place (loop depth, register counts, cache sizes) are not
+/// needed for a size report, so they are read and dropped.
+fn parseSmallStaticH(bytes: []const u8, at: usize, index: u32) Function {
+    const w0 = std.mem.readInt(u32, bytes[at..][0..4], .little);
+    const w1 = std.mem.readInt(u32, bytes[at + 4 ..][0..4], .little);
+    const frame_size = bytes[at + 8];
+    const flags: FunctionFlags = @bitCast(bytes[at + 11]);
+
+    return .{
+        .index = index,
+        .offset = w0 & 0x01FF_FFFF, // 25 bits
+        .param_count = (w0 >> 25) & 0x1F, // 5 bits
+        .bytecode_size = w1 & 0x3FFF, // 14 bits
+        .name_id = (w1 >> 14) & 0xFF, // 8 bits
+        .info_offset = 0, // not in this layout
+        .frame_size = frame_size,
+        .environment_size = 0, // not in this layout
         .flags = flags,
         .from_large_header = false,
     };
-
-    if (!flags.overflowed) return f;
-
-    // The offset is split across two of the small header's own fields; see
-    // SmallFuncHeader::getLargeHeaderOffset().
-    const large_at: u64 = (@as(u64, f.info_offset) << 16) | @as(u64, f.offset);
-    if (large_at + LARGE_FUNC_HEADER_SIZE > bytes.len) return error.BadLargeHeaderOffset;
-
-    var c = Cursor{ .bytes = bytes, .pos = @intCast(large_at) };
-    f.offset = c.u32le();
-    f.param_count = c.u32le();
-    f.bytecode_size = c.u32le();
-    f.name_id = c.u32le();
-    f.info_offset = c.u32le();
-    f.frame_size = c.u32le();
-    f.environment_size = c.u32le();
-    _ = c.u8v(); // highestReadCacheIndex
-    _ = c.u8v(); // highestWriteCacheIndex
-    f.flags = @bitCast(c.u8v());
-    f.from_large_header = true;
-    return f;
 }
 
 /// Caller owns the returned slice.
@@ -235,7 +352,7 @@ pub fn parseFunctions(
 ) (FunctionError || std.mem.Allocator.Error)![]Function {
     const list = try gpa.alloc(Function, h.function_count);
     errdefer gpa.free(list);
-    for (list, 0..) |*slot, i| slot.* = try parseFunction(bytes, @intCast(i));
+    for (list, 0..) |*slot, i| slot.* = try parseFunction(bytes, h, @intCast(i));
     return list;
 }
 
@@ -345,11 +462,16 @@ pub const Section = struct {
     bytes: u64,
 };
 
-pub const SECTION_COUNT = 15;
+pub const SECTION_COUNT = 16;
 
 /// Only what the header states exactly. The caller reports whatever is left
 /// over as one `rest` bucket rather than estimating it.
-pub fn sections(h: Header, bytecode_bytes: u64, buf: *[SECTION_COUNT]Section) []Section {
+pub fn sections(
+    h: Header,
+    bytecode_bytes: u64,
+    overflowed_headers: u32,
+    buf: *[SECTION_COUNT]Section,
+) []Section {
     const debug_info: u64 = blk: {
         if (h.debug_info_offset == 0) break :blk 0;
         const end = @as(u64, h.file_length);
@@ -367,14 +489,29 @@ pub fn sections(h: Header, bytecode_bytes: u64, buf: *[SECTION_COUNT]Section) []
 
     add(buf, &n, "header", HEADER_SIZE);
     add(buf, &n, "function headers", functionTableSize(h));
+    // A header that did not fit stores its real values in a full size header
+    // further into the file. That is a rounding error on the classic line, but
+    // `static_h` shrank the inline name field to 8 bits, so on a real bundle
+    // almost every function overflows and this becomes a section of its own.
+    add(buf, &n, "large function headers", @as(u64, overflowed_headers) *
+        Format.forVersion(h.version).largeFuncHeaderSize());
     add(buf, &n, "string kinds", @as(u64, h.string_kind_count) * 4);
     add(buf, &n, "identifier hashes", @as(u64, h.identifier_count) * 4);
     add(buf, &n, "string table", @as(u64, h.string_count) * 4);
     add(buf, &n, "overflow string table", @as(u64, h.overflow_string_count) * 8);
     add(buf, &n, "string storage", h.string_storage_size);
-    add(buf, &n, "array buffer", h.array_buffer_size);
-    add(buf, &n, "obj key buffer", h.obj_key_buffer_size);
-    add(buf, &n, "obj value buffer", h.obj_value_buffer_size);
+    switch (Format.forVersion(h.version)) {
+        .classic => {
+            add(buf, &n, "array buffer", h.array_buffer_size);
+            add(buf, &n, "obj key buffer", h.obj_key_buffer_size);
+            add(buf, &n, "obj value buffer", h.obj_value_buffer_size);
+        },
+        .static_h => {
+            add(buf, &n, "literal value buffer", h.array_buffer_size);
+            add(buf, &n, "obj key buffer", h.obj_key_buffer_size);
+            add(buf, &n, "obj shape table", objValueSectionSize(h));
+        },
+    }
     add(buf, &n, "bigint storage", h.bigint_storage_size);
     add(buf, &n, "regexp storage", h.regexp_storage_size);
     add(buf, &n, "function bytecode", bytecode_bytes);
@@ -458,7 +595,7 @@ test "unpacks small function header bitfields" {
         (0b00_1100 << 24) | (5 << 16) | (4 << 8) | 42,
     );
 
-    const f = try parseFunction(&b, 0);
+    const f = try parseFunction(&b, try parseHeader(&b), 0);
     try testing.expectEqual(@as(u32, 0x0012_3456), f.offset);
     try testing.expectEqual(@as(u32, 3), f.param_count);
     try testing.expectEqual(@as(u32, 0x1234), f.bytecode_size);
@@ -490,7 +627,7 @@ test "follows an overflowed function header" {
         c += 4;
     }
 
-    const f = try parseFunction(&b, 0);
+    const f = try parseFunction(&b, try parseHeader(&b), 0);
     try testing.expect(f.from_large_header);
     try testing.expectEqual(@as(u32, 0xDEAD), f.offset);
     try testing.expectEqual(@as(u32, 11), f.param_count);
@@ -504,7 +641,7 @@ test "rejects a truncated function table" {
     std.mem.writeInt(u64, b[0..8], MAGIC, .little);
     std.mem.writeInt(u32, b[8..12], 96, .little);
     std.mem.writeInt(u32, b[40..44], 1, .little);
-    try testing.expectError(error.TruncatedFunctionTable, parseFunction(&b, 0));
+    try testing.expectError(error.TruncatedFunctionTable, parseFunction(&b, try parseHeader(&b), 0));
 }
 
 test "counts shared function bodies once" {
@@ -543,4 +680,147 @@ test "section layout pads each section to 4 bytes" {
     try testing.expectEqual(@as(u64, 152), l.string_table);
     try testing.expectEqual(@as(u64, 164), l.overflow_string_table);
     try testing.expectEqual(@as(u64, 172), l.string_storage);
+}
+
+// --- static_h line ---------------------------------------------------------
+
+/// Writes a `static_h` file header. The field order matters: `static_h`
+/// inserted `numStringSwitchImms` after the object shape table count, so
+/// everything from `segmentID` on sits four bytes later than on the classic
+/// line.
+fn staticHFile(buf: []u8, values: [20]u32) void {
+    @memset(buf, 0);
+    std.mem.writeInt(u64, buf[0..8], MAGIC, .little);
+    std.mem.writeInt(u32, buf[8..12], 98, .little);
+    for (values, 0..) |v, i| {
+        std.mem.writeInt(u32, buf[32 + i * 4 ..][0..4], v, .little);
+    }
+}
+
+test "static_h shifts every field after the object shape table" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    var v = [_]u32{0} ** 20;
+    v[0] = 4096; // fileLength
+    v[2] = 7; // functionCount
+    v[12] = 111; // literalValueBufferSize
+    v[13] = 222; // objKeyBufferSize
+    v[14] = 333; // objShapeTableCount
+    v[15] = 444; // numStringSwitchImms, absent on the classic line
+    v[16] = 555; // segmentID
+    v[19] = 666; // debugInfoOffset
+    staticHFile(&b, v);
+
+    const h = try parseHeader(&b);
+    try testing.expectEqual(Format.static_h, Format.forVersion(h.version));
+    try testing.expectEqual(@as(u32, 111), h.array_buffer_size);
+    try testing.expectEqual(@as(u32, 333), h.obj_value_buffer_size);
+    try testing.expectEqual(@as(u32, 444), h.num_string_switch_imms);
+    try testing.expectEqual(@as(u32, 555), h.segment_id);
+    try testing.expectEqual(@as(u32, 666), h.debug_info_offset);
+}
+
+test "the object shape table stores a count, not a size" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    var v = [_]u32{0} ** 20;
+    v[14] = 10; // ten shape table entries
+    staticHFile(&b, v);
+    const h = try parseHeader(&b);
+    try testing.expectEqual(@as(u64, 10 * SHAPE_TABLE_ENTRY_SIZE), objValueSectionSize(h));
+
+    // The same slot on the classic line is already a byte count.
+    var classic = std.mem.zeroes(Header);
+    classic.version = 96;
+    classic.obj_value_buffer_size = 10;
+    try testing.expectEqual(@as(u64, 10), objValueSectionSize(classic));
+}
+
+test "unpacks a static_h small function header" {
+    var b = [_]u8{0} ** (HEADER_SIZE + 12);
+    var v = [_]u32{0} ** 20;
+    v[2] = 1; // functionCount
+    staticHFile(&b, v);
+
+    // offset 0x123456, paramCount 3, loopDepth 1
+    std.mem.writeInt(u32, b[128..][0..4], (1 << 30) | (3 << 25) | 0x0012_3456, .little);
+    // bytecodeSize 0x1234, functionName 200, then the register counts
+    std.mem.writeInt(u32, b[132..][0..4], (7 << 27) | (5 << 22) | (200 << 14) | 0x1234, .little);
+    b[136] = 9; // frameSize
+    b[139] = 0b00_1100; // strictMode + hasExceptionHandler
+
+    const f = try parseFunction(&b, try parseHeader(&b), 0);
+    try testing.expectEqual(@as(u32, 0x0012_3456), f.offset);
+    try testing.expectEqual(@as(u32, 3), f.param_count);
+    try testing.expectEqual(@as(u32, 0x1234), f.bytecode_size);
+    try testing.expectEqual(@as(u32, 200), f.name_id);
+    try testing.expectEqual(@as(u32, 9), f.frame_size);
+    try testing.expect(f.flags.strict_mode);
+    try testing.expect(f.flags.has_exception_handler);
+    try testing.expect(!f.flags.overflowed);
+}
+
+test "the large header offset is split differently on each line" {
+    const blank: FunctionFlags = @bitCast(@as(u8, 0));
+    var f = Function{
+        .index = 0,
+        .offset = 0,
+        .param_count = 0,
+        .bytecode_size = 0,
+        .name_id = 0,
+        .info_offset = 0,
+        .frame_size = 0,
+        .environment_size = 0,
+        .flags = blank,
+        .from_large_header = false,
+    };
+
+    // Classic packs the high half into infoOffset, 16 bits each.
+    f.offset = 0xBEEF;
+    f.info_offset = 0x00AB;
+    try testing.expectEqual(@as(u64, 0x00AB_BEEF), largeHeaderOffset(.classic, f));
+
+    // static_h has no infoOffset, so the high byte moved into functionName.
+    f.offset = 0x00CD_BEEF;
+    f.name_id = 0xAB;
+    try testing.expectEqual(@as(u64, 0xABCD_BEEF), largeHeaderOffset(.static_h, f));
+}
+
+test "follows an overflowed static_h header" {
+    const large_at = 300;
+    var b = [_]u8{0} ** (large_at + 64);
+    var v = [_]u32{0} ** 20;
+    v[2] = 1; // functionCount
+    staticHFile(&b, v);
+
+    std.mem.writeInt(u32, b[128..][0..4], large_at & 0xFF_FFFF, .little);
+    std.mem.writeInt(u32, b[132..][0..4], ((large_at >> 24) & 0xFF) << 14, .little);
+    b[139] = 0b10_0000; // overflowed
+
+    // offset, paramCount, loopDepth, bytecodeSize, functionName, two register
+    // counts, frameSize, then three cache bytes and flags.
+    var c: usize = large_at;
+    for ([_]u32{ 0xDEAD, 11, 2, 70_000, 90_000, 3, 4, 22 }) |x| {
+        std.mem.writeInt(u32, b[c..][0..4], x, .little);
+        c += 4;
+    }
+
+    const f = try parseFunction(&b, try parseHeader(&b), 0);
+    try testing.expect(f.from_large_header);
+    try testing.expectEqual(@as(u32, 0xDEAD), f.offset);
+    try testing.expectEqual(@as(u32, 11), f.param_count);
+    // Both exceed what the small header's 14 and 8 bits could hold.
+    try testing.expectEqual(@as(u32, 70_000), f.bytecode_size);
+    try testing.expectEqual(@as(u32, 90_000), f.name_id);
+    try testing.expectEqual(@as(u32, 22), f.frame_size);
+}
+
+test "the function table entry size follows the format" {
+    var classic = std.mem.zeroes(Header);
+    classic.version = 96;
+    classic.function_count = 10;
+    try testing.expectEqual(@as(u64, 160), functionTableSize(classic));
+
+    var modern = std.mem.zeroes(Header);
+    modern.version = 98;
+    modern.function_count = 10;
+    try testing.expectEqual(@as(u64, 120), functionTableSize(modern));
 }
