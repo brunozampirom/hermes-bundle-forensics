@@ -306,6 +306,62 @@ pub fn moreByBytecodeSize(_: void, a: Function, b: Function) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Section offsets
+// ---------------------------------------------------------------------------
+
+pub fn alignUp(v: u64) u64 {
+    return (v + (ALIGNMENT - 1)) & ~@as(u64, ALIGNMENT - 1);
+}
+
+/// Byte offsets of the sections we need to address directly. The order is
+/// `visitBytecodeSegmentsInOrder()` from BytecodeFileFormat.h, and every
+/// section is preceded by `pad(BYTECODE_ALIGNMENT)`, so each one starts at the
+/// next 4-byte boundary after the previous one ends.
+///
+/// Only the sections up to string storage are computed: everything past it
+/// (array, object, bigint, regexp, CJS and function-source tables) is reported
+/// by size alone and never addressed, so deriving those offsets would be
+/// untested code.
+pub const Layout = struct {
+    function_headers: u64,
+    string_kinds: u64,
+    identifier_hashes: u64,
+    string_table: u64,
+    overflow_string_table: u64,
+    string_storage: u64,
+};
+
+pub fn layout(h: Header) Layout {
+    var at: u64 = HEADER_SIZE;
+
+    const function_headers = alignUp(at);
+    at = function_headers + functionTableSize(h);
+
+    const string_kinds = alignUp(at);
+    at = string_kinds + @as(u64, h.string_kind_count) * 4;
+
+    const identifier_hashes = alignUp(at);
+    at = identifier_hashes + @as(u64, h.identifier_count) * 4;
+
+    const string_table = alignUp(at);
+    at = string_table + @as(u64, h.string_count) * 4;
+
+    const overflow_string_table = alignUp(at);
+    at = overflow_string_table + @as(u64, h.overflow_string_count) * 8;
+
+    const string_storage = alignUp(at);
+
+    return .{
+        .function_headers = function_headers,
+        .string_kinds = string_kinds,
+        .identifier_hashes = identifier_hashes,
+        .string_table = string_table,
+        .overflow_string_table = overflow_string_table,
+        .string_storage = string_storage,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Section map
 // ---------------------------------------------------------------------------
 

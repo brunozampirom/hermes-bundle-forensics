@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const hbc = @import("hbc.zig");
+const strings = @import("strings.zig");
 
 const usage =
     \\hbcinfo — Hermes bundle forensics
@@ -76,7 +77,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    try report(out, args.path, bytes.len, h, functions, args.top);
+    // A bundle whose string sections do not line up is still worth reporting
+    // on — the caller loses names, not the whole analysis.
+    const table: ?strings.Table = strings.Table.init(bytes, h) catch null;
+
+    try report(out, args.path, bytes.len, h, functions, table, args.top);
     try out.flush();
 }
 
@@ -167,6 +172,7 @@ fn report(
     file_size: usize,
     h: hbc.Header,
     functions: []hbc.Function,
+    table: ?strings.Table,
     top: u32,
 ) !void {
     try reportIdentity(out, path, file_size, h);
@@ -206,6 +212,35 @@ fn report(
     }
     try out.print("  overflowed headers {d}\n", .{stats.overflowed_headers});
 
+    if (table) |t| {
+        const ss = strings.stats(t);
+        try out.print("\nstrings\n", .{});
+        try out.print("  storage buffer     {d} bytes\n", .{h.string_storage_size});
+        try out.print("  sum of lengths     {d} bytes\n", .{ss.sum_of_lengths});
+        // Hermes packs strings so that one which is a suffix of another shares
+        // its bytes, so the lengths normally add up to more than the buffer.
+        if (ss.sum_of_lengths > h.string_storage_size) {
+            const saved = ss.sum_of_lengths - h.string_storage_size;
+            const tenths = saved * 1000 / ss.sum_of_lengths;
+            try out.print("  packer overlap     {d} bytes saved ({d}.{d}%)\n", .{
+                saved, tenths / 10, tenths % 10,
+            });
+        } else if (ss.sum_of_lengths < h.string_storage_size) {
+            try out.print("  unreferenced       {d} bytes no entry points at\n", .{
+                h.string_storage_size - ss.sum_of_lengths,
+            });
+        }
+        try out.print("  utf-16 strings     {d}  ({d} bytes, 2 per code unit)\n", .{
+            ss.utf16_strings, ss.utf16_bytes,
+        });
+        try out.print("  overflowed entries {d}\n", .{ss.overflowed});
+        if (ss.unreadable > 0) {
+            try out.print("  unreadable         {d}\n", .{ss.unreadable});
+        }
+    } else {
+        try out.print("\nstrings            section offsets do not fit the file; skipped\n", .{});
+    }
+
     try out.print("\nsection map\n", .{});
     var buf: [hbc.SECTION_COUNT]hbc.Section = undefined;
     const secs = hbc.sections(h, stats.distinct_bytes, &buf);
@@ -218,18 +253,75 @@ fn report(
     const rest = if (file_size > known) file_size - known else 0;
     try printSection(out, "rest (info + padding)", rest, file_size);
 
-    if (top > 0 and functions.len > 0) try reportTopFunctions(out, functions, top);
+    if (top > 0 and functions.len > 0) try reportTopFunctions(out, functions, table, top);
+    if (top > 0) {
+        if (table) |t| try reportTopStrings(out, t, top);
+    }
 }
 
-fn reportTopFunctions(out: *Io.Writer, functions: []hbc.Function, top: u32) !void {
+fn reportTopFunctions(
+    out: *Io.Writer,
+    functions: []hbc.Function,
+    table: ?strings.Table,
+    top: u32,
+) !void {
     std.sort.pdq(hbc.Function, functions, {}, hbc.moreByBytecodeSize);
     const n = @min(@as(usize, top), functions.len);
 
     try out.print("\ntop {d} functions by bytecode size\n", .{n});
     for (functions[0..n]) |f| {
-        try out.print("  {d:>8} bytes  #{d:<7} name id {d:<7} params {d:<3} frame {d}\n", .{
-            f.bytecode_size, f.index, f.name_id, f.param_count, f.frame_size,
+        try out.print("  {d:>8} bytes  #{d:<7} params {d:<3} frame {d:<4} ", .{
+            f.bytecode_size, f.index, f.param_count, f.frame_size,
         });
+        if (table) |t| {
+            if (t.get(f.name_id)) |name| {
+                if (name.bytes.len == 0) {
+                    try out.print("(anonymous)", .{});
+                } else {
+                    try strings.writeEscaped(out, name, 60);
+                }
+            } else |_| {
+                try out.print("name id {d} (unreadable)", .{f.name_id});
+            }
+        } else {
+            try out.print("name id {d}", .{f.name_id});
+        }
+        try out.print("\n", .{});
+    }
+}
+
+const StringRef = struct { id: u32, bytes: u32 };
+
+fn moreByStringBytes(_: void, a: StringRef, b: StringRef) bool {
+    if (a.bytes != b.bytes) return a.bytes > b.bytes;
+    return a.id < b.id;
+}
+
+fn reportTopStrings(out: *Io.Writer, t: strings.Table, top: u32) !void {
+    const gpa = std.heap.page_allocator;
+    const refs = gpa.alloc(StringRef, t.count) catch return;
+    defer gpa.free(refs);
+
+    var n: usize = 0;
+    var id: u32 = 0;
+    while (id < t.count) : (id += 1) {
+        const s = t.get(id) catch continue;
+        refs[n] = .{ .id = id, .bytes = @intCast(s.bytes.len) };
+        n += 1;
+    }
+    if (n == 0) return;
+
+    std.sort.pdq(StringRef, refs[0..n], {}, moreByStringBytes);
+    const show = @min(@as(usize, top), n);
+
+    try out.print("\ntop {d} strings by size\n", .{show});
+    for (refs[0..show]) |r| {
+        const s = t.get(r.id) catch continue;
+        try out.print("  {d:>8} bytes  #{d:<7} {s}", .{
+            r.bytes, r.id, if (s.is_utf16) "utf16 " else "      ",
+        });
+        try strings.writeEscaped(out, s, 60);
+        try out.print("\n", .{});
     }
 }
 
@@ -370,6 +462,115 @@ test "counts shared function bodies once" {
     try std.testing.expectEqual(@as(u64, 45), stats.total_bytes);
     try std.testing.expectEqual(@as(u64, 35), stats.distinct_bytes);
     try std.testing.expectEqual(@as(u32, 2), stats.distinct_bodies);
+}
+
+test "section layout pads each section to 4 bytes" {
+    var h = std.mem.zeroes(hbc.Header);
+    h.function_count = 1; // 16 bytes, already aligned
+    h.string_kind_count = 1; // 4 bytes
+    h.identifier_count = 1; // 4 bytes
+    h.string_count = 3; // 12 bytes
+    h.overflow_string_count = 1; // 8 bytes
+
+    const l = hbc.layout(h);
+    try std.testing.expectEqual(@as(u64, 128), l.function_headers);
+    try std.testing.expectEqual(@as(u64, 144), l.string_kinds);
+    try std.testing.expectEqual(@as(u64, 148), l.identifier_hashes);
+    try std.testing.expectEqual(@as(u64, 152), l.string_table);
+    try std.testing.expectEqual(@as(u64, 164), l.overflow_string_table);
+    try std.testing.expectEqual(@as(u64, 172), l.string_storage);
+}
+
+test "alignUp rounds to the next 4-byte boundary" {
+    try std.testing.expectEqual(@as(u64, 0), hbc.alignUp(0));
+    try std.testing.expectEqual(@as(u64, 4), hbc.alignUp(1));
+    try std.testing.expectEqual(@as(u64, 4), hbc.alignUp(4));
+    try std.testing.expectEqual(@as(u64, 8), hbc.alignUp(5));
+}
+
+// Two strings: a plain one, and one whose small entry overflows. The overflow
+// entry's index lives in the small entry's `offset` field, which is the part
+// that reads like a byte offset and is not.
+test "resolves strings through the overflow table" {
+    const storage_at = 144;
+    var b = [_]u8{0} ** (storage_at + 400);
+    std.mem.writeInt(u64, b[0..8], hbc.MAGIC, .little);
+    std.mem.writeInt(u32, b[8..12], 96, .little);
+
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 2;
+    h.overflow_string_count = 1;
+    h.string_storage_size = 305;
+
+    const l = hbc.layout(h);
+    try std.testing.expectEqual(@as(u64, 128), l.string_table);
+    try std.testing.expectEqual(@as(u64, 136), l.overflow_string_table);
+    try std.testing.expectEqual(@as(u64, storage_at), l.string_storage);
+
+    // entry 0: offset 0, length 5, ascii
+    std.mem.writeInt(u32, b[128..][0..4], (5 << 24) | (0 << 1), .little);
+    // entry 1: length 0xFF marks overflow; offset field holds index 0
+    std.mem.writeInt(u32, b[132..][0..4], (0xFF << 24) | (0 << 1), .little);
+    // overflow entry 0: real offset 5, real length 300
+    std.mem.writeInt(u32, b[136..][0..4], 5, .little);
+    std.mem.writeInt(u32, b[140..][0..4], 300, .little);
+    @memcpy(b[storage_at..][0..5], "hello");
+    @memset(b[storage_at + 5 ..][0..300], 'x');
+
+    const t = try strings.Table.init(&b, h);
+
+    const s0 = try t.get(0);
+    try std.testing.expectEqualStrings("hello", s0.bytes);
+    try std.testing.expect(!s0.overflowed);
+    try std.testing.expect(!s0.is_utf16);
+
+    const s1 = try t.get(1);
+    try std.testing.expectEqual(@as(usize, 300), s1.bytes.len);
+    try std.testing.expect(s1.overflowed);
+    try std.testing.expectEqual(@as(u8, 'x'), s1.bytes[0]);
+
+    try std.testing.expectError(error.NoSuchString, t.get(2));
+
+    const st = strings.stats(t);
+    try std.testing.expectEqual(@as(u64, 305), st.sum_of_lengths);
+    try std.testing.expectEqual(@as(u32, 1), st.overflowed);
+    try std.testing.expectEqual(@as(u32, 0), st.unreadable);
+}
+
+test "utf-16 strings cost two bytes per code unit" {
+    const storage_at = 132;
+    var b = [_]u8{0} ** (storage_at + 16);
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 1;
+    h.string_storage_size = 8;
+
+    // offset 0, length 4 code units, isUTF16 set
+    std.mem.writeInt(u32, b[128..][0..4], (4 << 24) | (0 << 1) | 1, .little);
+    for ([_]u16{ 'a', 'b', 0x00E9, 0x2603 }, 0..) |cu, i| {
+        std.mem.writeInt(u16, b[storage_at + i * 2 ..][0..2], cu, .little);
+    }
+
+    const t = try strings.Table.init(&b, h);
+    const s = try t.get(0);
+    try std.testing.expect(s.is_utf16);
+    try std.testing.expectEqual(@as(u32, 4), s.len);
+    try std.testing.expectEqual(@as(usize, 8), s.bytes.len);
+
+    const st = strings.stats(t);
+    try std.testing.expectEqual(@as(u64, 8), st.utf16_bytes);
+    try std.testing.expectEqual(@as(u32, 1), st.utf16_strings);
+}
+
+test "rejects a string entry pointing outside storage" {
+    var b = [_]u8{0} ** 160;
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 1;
+    h.string_storage_size = 4;
+    // offset 2, length 10 -> runs past the 4-byte storage
+    std.mem.writeInt(u32, b[128..][0..4], (10 << 24) | (2 << 1), .little);
+
+    const t = try strings.Table.init(&b, h);
+    try std.testing.expectError(error.BadStringEntry, t.get(0));
 }
 
 test "rejects a truncated function table" {
