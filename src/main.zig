@@ -4,20 +4,22 @@ const std = @import("std");
 const Io = std.Io;
 const hbc = @import("hbc.zig");
 const strings = @import("strings.zig");
+const container = @import("container.zig");
 
 const usage =
     \\hbcinfo — Hermes bundle forensics
     \\
     \\usage:
-    \\  hbcinfo [--top N] <file.hbc|index.android.bundle>
+    \\  hbcinfo [options] <file>
+    \\
+    \\<file> is either a raw Hermes bundle, or an .apk / .aab / .ipa to
+    \\pull one out of. Containers are detected by signature, not extension.
     \\
     \\options:
-    \\  --top N   list the N largest functions by bytecode size (default 10,
-    \\            0 to skip the listing)
-    \\
-    \\The file must be raw HBC. Pulling the bundle out of an .apk is not
-    \\supported yet — unzip it first:
-    \\  unzip -p app.apk assets/index.android.bundle > bundle.hbc
+    \\  --top N        list the N largest functions and strings (default 10,
+    \\                 0 to skip both listings)
+    \\  --entry PATH   which bundle to read, when a container holds several
+    \\  --list         list the bundles in a container and exit
     \\
 ;
 
@@ -28,6 +30,8 @@ const max_bundle: Io.Limit = .limited(512 * 1024 * 1024);
 const Args = struct {
     path: []const u8,
     top: u32 = 10,
+    entry: ?[]const u8 = null,
+    list: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -45,14 +49,26 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    const bytes = Io.Dir.cwd().readFileAlloc(io, args.path, arena, max_bundle) catch |err| {
-        try out.print("error: could not read {s}: {s}\n", .{ args.path, @errorName(err) });
-        try out.flush();
-        std.process.exit(1);
+    const loaded = load(arena, io, out, args) catch |err| switch (err) {
+        error.Reported => {
+            try out.flush();
+            std.process.exit(1);
+        },
+        else => {
+            try out.print("error: could not read {s}: {s}\n", .{ args.path, @errorName(err) });
+            try out.flush();
+            std.process.exit(1);
+        },
     };
+    if (args.list) {
+        try out.flush();
+        return;
+    }
+    const bytes = loaded.bytes;
+    const label = loaded.label;
 
     const h = hbc.parseHeader(bytes) catch |err| {
-        try reportParseError(out, args.path, bytes, err);
+        try reportParseError(out, label, bytes, err);
         try out.flush();
         std.process.exit(1);
     };
@@ -81,13 +97,103 @@ pub fn main(init: std.process.Init) !void {
     // on — the caller loses names, not the whole analysis.
     const table: ?strings.Table = strings.Table.init(bytes, h) catch null;
 
-    try report(out, args.path, bytes.len, h, functions, table, args.top);
+    try report(out, label, bytes.len, h, functions, table, args.top);
     try out.flush();
+}
+
+const Loaded = struct {
+    bytes: []u8,
+    /// What to print as the source: the plain path, or `container!entry`.
+    label: []const u8,
+};
+
+/// Signals that a specific, useful message has already been written, so the
+/// caller should exit rather than print a generic error on top of it.
+const Reported = error{Reported};
+
+fn load(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    args: Args,
+) !Loaded {
+    const file = try Io.Dir.cwd().openFile(io, args.path, .{});
+    defer file.close(io);
+
+    const buf = try arena.alloc(u8, 64 * 1024);
+    var reader = file.reader(io, buf);
+
+    var sig: [4]u8 = undefined;
+    const n = try reader.interface.readSliceShort(&sig);
+    const is_zip = container.looksLikeZip(sig[0..n]);
+
+    if (!is_zip) {
+        if (args.list) {
+            try out.print("{s} is not a container; nothing to list\n", .{args.path});
+            return error.Reported;
+        }
+        if (args.entry != null) {
+            try out.print("error: --entry only applies to .apk/.aab/.ipa containers\n", .{});
+            return error.Reported;
+        }
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, args.path, arena, max_bundle);
+        return .{ .bytes = bytes, .label = args.path };
+    }
+
+    const found = try container.findBundles(arena, &reader);
+
+    if (args.list) {
+        if (found.len == 0) {
+            try out.print("{s}: no Hermes bundle found\n", .{args.path});
+        } else {
+            try out.print("{s}\n", .{args.path});
+            for (found) |e| {
+                try out.print("  {d:>10} bytes  {s}{s}\n", .{
+                    e.uncompressed_size,
+                    e.name,
+                    if (e.stored) "  (stored)" else "",
+                });
+            }
+        }
+        return .{ .bytes = &.{}, .label = args.path };
+    }
+
+    const name = if (args.entry) |want| blk: {
+        for (found) |e| {
+            if (std.mem.eql(u8, e.name, want)) break :blk e.name;
+        }
+        try out.print("error: {s} has no entry {s}\n", .{ args.path, want });
+        try out.print("       run with --list to see the bundles it does have\n", .{});
+        return error.Reported;
+    } else switch (found.len) {
+        0 => {
+            try out.print("error: no Hermes bundle inside {s}\n", .{args.path});
+            return error.Reported;
+        },
+        1 => found[0].name,
+        // Split APKs and multi-module AABs legitimately carry several. Picking
+        // one silently would make the numbers a guess about which.
+        else => {
+            try out.print("error: {s} holds {d} bundles; pick one with --entry\n", .{
+                args.path, found.len,
+            });
+            for (found) |e| {
+                try out.print("       {d:>10} bytes  {s}\n", .{ e.uncompressed_size, e.name });
+            }
+            return error.Reported;
+        },
+    };
+
+    const bytes = try container.readEntry(arena, &reader, name);
+    const label = try std.fmt.allocPrint(arena, "{s}!{s}", .{ args.path, name });
+    return .{ .bytes = bytes, .label = label };
 }
 
 fn parseArgs(argv: []const [:0]const u8) ?Args {
     var path: ?[]const u8 = null;
     var top: u32 = 10;
+    var entry: ?[]const u8 = null;
+    var list = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -96,6 +202,12 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
             i += 1;
             if (i >= argv.len) return null;
             top = std.fmt.parseUnsigned(u32, argv[i], 10) catch return null;
+        } else if (std.mem.eql(u8, a, "--entry")) {
+            i += 1;
+            if (i >= argv.len) return null;
+            entry = argv[i];
+        } else if (std.mem.eql(u8, a, "--list")) {
+            list = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
             return null;
         } else {
@@ -104,7 +216,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
         }
     }
 
-    return .{ .path = path orelse return null, .top = top };
+    return .{ .path = path orelse return null, .top = top, .entry = entry, .list = list };
 }
 
 fn reportParseError(
@@ -571,6 +683,23 @@ test "rejects a string entry pointing outside storage" {
 
     const t = try strings.Table.init(&b, h);
     try std.testing.expectError(error.BadStringEntry, t.get(0));
+}
+
+test "detects a zip container by signature, not extension" {
+    try std.testing.expect(container.looksLikeZip("PK\x03\x04rest"));
+    try std.testing.expect(!container.looksLikeZip("PK\x05\x06")); // empty-archive record
+    try std.testing.expect(!container.looksLikeZip(&[_]u8{ 0xC6, 0x1F, 0xBC, 0x03 }));
+    try std.testing.expect(!container.looksLikeZip("PK"));
+    try std.testing.expect(!container.looksLikeZip(""));
+}
+
+test "recognises bundle paths in each container layout" {
+    try std.testing.expect(container.looksLikeBundleName("assets/index.android.bundle"));
+    try std.testing.expect(container.looksLikeBundleName("base/assets/index.android.bundle"));
+    try std.testing.expect(container.looksLikeBundleName("Payload/Sintonia.app/main.jsbundle"));
+    try std.testing.expect(container.looksLikeBundleName("whatever/app.hbc"));
+    try std.testing.expect(!container.looksLikeBundleName("res/drawable/icon.png"));
+    try std.testing.expect(!container.looksLikeBundleName("AndroidManifest.xml"));
 }
 
 test "rejects a truncated function table" {
