@@ -104,6 +104,17 @@ Functions are matched by name, which only works for names unique to both
 bundles; the report says how many it could not match rather than pretending
 the rest vanished.
 
+## Install
+
+Prebuilt binaries for linux, macOS and Windows, on x86_64 and aarch64, are on
+the [releases page](https://github.com/brunozampirom/hermes-bundle-forensics/releases).
+Each release ships a `SHA256SUMS` file.
+
+```sh
+tar -xzf hbcinfo-v0.1.0-aarch64-macos.tar.gz
+./hbcinfo-v0.1.0-aarch64-macos/hbcinfo app-release.aab
+```
+
 ## Usage
 
 ```
@@ -132,7 +143,7 @@ tool refuses rather than reading garbage.
 module boundary in the bytecode, so anything module-level would have to come
 from a Metro source map, which is a different tool.
 
-## Build
+## Build from source
 
 Requires [Zig](https://ziglang.org/download/) 0.16.0. No other dependencies:
 no CMake, no libc, no Visual Studio.
