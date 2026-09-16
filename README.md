@@ -1,7 +1,7 @@
 # hermes-bundle-forensics
 
-`hbcinfo` reads a Hermes bytecode bundle — out of an `.apk`, `.aab`, `.ipa` or
-a raw `.hbc` — and tells you where its bytes went.
+`hbcinfo` reads a Hermes bytecode bundle, from an `.apk`, `.aab`, `.ipa` or a
+raw `.hbc`, and tells you where its bytes went.
 
 It found this on a real shipped app, comparing the Android and iOS artifacts of
 one build:
@@ -99,7 +99,7 @@ $ hbcinfo app-release.aab app-release.ipa
 ```
 
 Sections and counts line up exactly, and the section deltas sum to the total
-delta — if they ever stop doing that, something is being double-counted.
+delta. If they ever stop doing that, something is being double-counted.
 Functions are matched by name, which only works for names unique to both
 bundles; the report says how many it could not match rather than pretending
 the rest vanished.
@@ -116,13 +116,13 @@ hbcinfo [options] <file> [file-b]
 ```
 
 Containers are detected by the `PK\x03\x04` signature, not by extension. A
-container holding several bundles — split APKs, multi-module AABs — is an error
+container holding several bundles (split APKs, multi-module AABs) is an error
 rather than a silent pick, since which one the numbers describe would otherwise
 be a guess.
 
 ## Scope
 
-**Bytecode versions 90–96.** 96 is current for Hermes (`BytecodeVersion.h`) and
+**Bytecode versions 90-96.** 96 is current for Hermes (`BytecodeVersion.h`) and
 is what React Native ships. Below 90, fields are missing from the header; the
 tool refuses rather than reading garbage.
 
@@ -134,7 +134,7 @@ from a Metro source map, which is a different tool.
 
 ## Build
 
-Requires [Zig](https://ziglang.org/download/) 0.16.0. No other dependencies —
+Requires [Zig](https://ziglang.org/download/) 0.16.0. No other dependencies:
 no CMake, no libc, no Visual Studio.
 
 ```sh
@@ -173,13 +173,13 @@ Three details in the format are easy to read wrong, and each has its own test:
   section map with percentages over 100% for a truncated bundle. Refusing to
   answer beats answering wrong.
 - **Deduplicated function bodies are counted once.** Hermes shares identical
-  bodies between headers, so summing every function's size overcounts — by
+  bodies between headers, so summing every function's size overcounts, by
   80 KB on the bundle above.
 - **The container path has no unit tests.** Its pure helpers do; the zip reading
   itself is covered by an end-to-end check that reading from a container gives
   output identical to unzipping first. Building zip fixtures in-process was not
   worth the code.
-- **Validated on one app's real artifacts** — a matching `.aab` and `.ipa` —
+- **Validated on one app's real artifacts**, a matching `.aab` and `.ipa`,
   plus synthetic bundles from `hermesc`. Not yet run across a corpus.
 
 ## Generating a test bundle

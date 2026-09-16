@@ -1,4 +1,4 @@
-//! hbcinfo — what is inside a Hermes bundle, and what each part costs.
+//! hbcinfo: what is inside a Hermes bundle, and what each part costs.
 
 const std = @import("std");
 const Io = std.Io;
@@ -7,7 +7,7 @@ const strings = @import("strings.zig");
 const container = @import("container.zig");
 
 const usage =
-    \\hbcinfo — Hermes bundle forensics
+    \\hbcinfo: Hermes bundle forensics
     \\
     \\usage:
     \\  hbcinfo [options] <file>
@@ -23,8 +23,7 @@ const usage =
     \\
 ;
 
-/// Real bundles run to tens of megabytes; 512 MiB is enough headroom that the
-/// limit never needs thinking about.
+/// Real bundles run to tens of megabytes.
 const max_bundle: Io.Limit = .limited(512 * 1024 * 1024);
 
 const Args = struct {
@@ -73,7 +72,7 @@ const Loaded = struct {
     label: []const u8,
 };
 
-/// One parsed bundle, everything both the single-file report and the diff need.
+/// Everything both the single-file report and the diff need.
 const Bundle = struct {
     label: []const u8,
     bytes: []u8,
@@ -129,7 +128,7 @@ fn open(
     if (bytes.len < h.file_length) {
         try reportIdentity(out, label, bytes.len, h);
         try out.print(
-            "\nerror: truncated — header declares {d} bytes, {d} missing\n",
+            "\nerror: truncated; header declares {d} bytes, {d} missing\n",
             .{ h.file_length, h.file_length - bytes.len },
         );
         try out.flush();
@@ -144,7 +143,7 @@ fn open(
     };
 
     // A bundle whose string sections do not line up is still worth reporting
-    // on — the caller loses names, not the whole analysis.
+    // on; the caller loses names, not the whole analysis.
     const table: ?strings.Table = strings.Table.init(bytes, h) catch null;
 
     return .{
@@ -156,8 +155,7 @@ fn open(
     };
 }
 
-/// Signals that a specific, useful message has already been written, so the
-/// caller should exit rather than print a generic error on top of it.
+/// A specific message was already written; do not print a generic one over it.
 const Reported = error{Reported};
 
 fn load(
@@ -300,7 +298,7 @@ fn reportParseError(
             // The usual mistake: a dev bundle, which is plain JS because it
             // never went through hermesc.
             if (looksLikeText(bytes)) {
-                try out.print("       looks like plain JS — dev bundles skip hermesc\n", .{});
+                try out.print("       looks like plain JS; dev bundles skip hermesc\n", .{});
             }
         },
         error.DeltaPrepped => try out.print(
@@ -317,9 +315,8 @@ fn reportParseError(
     }
 }
 
-/// Heuristic for the most common mistake: pointing the tool at a dev bundle,
-/// which is JS in plain text. If the start of the file is all printable ASCII,
-/// it is not bytecode.
+/// Catches the common mistake of pointing the tool at a dev bundle, which is
+/// plain JS text rather than bytecode.
 fn looksLikeText(bytes: []const u8) bool {
     const n = @min(bytes.len, 64);
     if (n == 0) return false;
@@ -351,17 +348,15 @@ fn printDelta(out: *Io.Writer, name: []const u8, a: u64, b: u64) !void {
     });
 }
 
-/// Diffing two bundles of the same app is the question people actually ask:
-/// not "how big is this" but "what grew". Sections and counts line up exactly.
-/// Functions are matched by name, which only works for names that are unique
-/// in both bundles — the report says how many it could not match rather than
-/// pretending the rest vanished.
+/// Sections and counts line up exactly. Functions are matched by name, which
+/// only works for names unique to both bundles, so the report says how many it
+/// could not match.
 fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top: u32) !void {
     try out.print("a  {s}\n", .{a.label});
     try out.print("b  {s}\n", .{b.label});
 
     if (std.mem.eql(u8, &a.header.source_hash, &b.header.source_hash)) {
-        try out.print("\nsame source hash — these were built from identical sources\n", .{});
+        try out.print("\nsame source hash; these were built from identical sources\n", .{});
     }
 
     try out.print("\n{s:<26} {s:>12} {s:>12}   {s}\n", .{ "", "a", "b", "delta" });
@@ -407,8 +402,7 @@ fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top
     try reportFunctionDiff(out, gpa, a, b, top);
 }
 
-/// Strings are content-addressable, so they diff exactly: no matching
-/// heuristic, no ambiguity.
+/// Strings are content-addressable, so they diff exactly.
 fn reportStringDiff(out: *Io.Writer, gpa: std.mem.Allocator, ta: strings.Table, tb: strings.Table) !void {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(gpa);
@@ -514,7 +508,7 @@ fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
     try reportIdentity(out, b.label, file_size, h);
 
     // fileLength covers through the end of the footer, so a file larger than
-    // declared is just padding or concatenation — note it and move on.
+    // declared is just padding or concatenation; note it and move on.
     if (file_size > h.file_length) {
         try out.print("warning          header declares {d} bytes; {d} trail the footer\n", .{
             h.file_length, file_size - h.file_length,
@@ -662,8 +656,7 @@ fn reportTopStrings(out: *Io.Writer, t: strings.Table, top: u32) !void {
 }
 
 fn printSection(out: *Io.Writer, name: []const u8, bytes: u64, total: u64) !void {
-    // Percentages in tenths, using integers: identical output on every
-    // platform, which matters once this gates a size check in CI.
+    // Integer tenths, so output is identical on every platform.
     const tenths: u64 = if (total == 0) 0 else bytes * 1000 / total;
     try out.print("  {s:<30} {d:>12}  {d:>3}.{d}%\n", .{
         name, bytes, tenths / 10, tenths % 10,

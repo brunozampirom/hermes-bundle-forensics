@@ -1,12 +1,7 @@
-//! Reading a Hermes bundle straight out of an app container.
+//! `.apk`, `.aab` and `.ipa` are all zip files, so one path covers all three.
 //!
-//! `.apk`, `.aab` and `.ipa` are all zip files, so one code path covers all
-//! three. We detect by signature rather than by extension: the extension is a
-//! convention, the `PK\x03\x04` at offset 0 is the format.
-//!
-//! `std.zip` iterates the central directory and can decompress, but its
-//! `Entry.extract` only writes to a directory. We want the bytes in memory, so
-//! we reuse its iterator and do the local-header walk ourselves.
+//! `std.zip`'s `Entry.extract` only writes to a directory, so we reuse its
+//! central directory iterator and walk to the local header ourselves.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,12 +21,8 @@ pub fn looksLikeZip(first_bytes: []const u8) bool {
     return first_bytes.len >= 4 and std.mem.eql(u8, first_bytes[0..4], &signature);
 }
 
-/// Paths that hold a Hermes bundle in the containers we care about:
-///   .apk  assets/index.android.bundle
-///   .aab  base/assets/index.android.bundle
-///   .ipa  Payload/<App>.app/main.jsbundle
-/// Matching on the tail keeps this working for split APKs and feature modules,
-/// where the prefix varies.
+/// Matched on the tail, since the prefix varies across split APKs and feature
+/// modules: `assets/`, `base/assets/`, `Payload/<App>.app/`.
 pub fn looksLikeBundleName(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "index.android.bundle") or
         std.mem.endsWith(u8, name, "main.jsbundle") or
@@ -45,7 +36,7 @@ pub const Entry = struct {
     stored: bool,
 };
 
-/// Every entry in the container that looks like a Hermes bundle.
+/// Every entry that looks like a Hermes bundle.
 pub fn findBundles(gpa: std.mem.Allocator, input: *Io.File.Reader) ![]Entry {
     var found: std.ArrayList(Entry) = .empty;
     errdefer {
@@ -93,9 +84,8 @@ pub fn readEntry(
             else => return error.UnsupportedCompressionMethod,
         }
 
-        // The central directory records where the local header is; the data
-        // starts after that header plus its own (possibly different) filename
-        // and extra fields.
+        // Data starts after the local header plus its own filename and extra
+        // fields, whose lengths can differ from the central directory's.
         try input.seekTo(entry.file_offset);
         const local = try input.interface.takeStruct(zip.LocalFileHeader, .little);
         if (!std.mem.eql(u8, &local.signature, &zip.local_file_header_sig)) {
@@ -122,13 +112,8 @@ pub fn readEntry(
     return error.EntryNotFound;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-//
-// The zip reading itself has no unit test: building fixtures in-process was
-// not worth the code. It is covered end to end by checking that reading a
-// bundle from a container gives output identical to unzipping it first.
-// ---------------------------------------------------------------------------
+// The zip reading itself has no unit test; it is covered end to end by
+// checking that reading from a container matches unzipping first.
 
 const testing = std.testing;
 

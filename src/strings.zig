@@ -1,38 +1,29 @@
-//! The Hermes string table.
+//! The Hermes string table: a 4-byte entry per string packing
+//! `isUTF16:1, offset:23, length:8`, plus one shared character buffer.
 //!
-//! Strings live in two places: a fixed 4-byte entry per string, and one shared
-//! character buffer. The small entry packs `isUTF16:1, offset:23, length:8`.
-//! When a string is longer than 254 bytes or sits past 8 MiB in the buffer, the
-//! small entry cannot hold it: `length` is set to 0xFF and `offset` becomes an
-//! *index* into the overflow table, which stores the real offset and length as
-//! full u32s. That indirection is easy to get wrong — `offset` looks like a
-//! byte offset and is not — so it has its own test.
+//! When a string does not fit those widths, `length` is 0xFF and `offset`
+//! becomes an *index* into the overflow table rather than a byte offset.
 
 const std = @import("std");
 const hbc = @import("hbc.zig");
 
 pub const SMALL_ENTRY_SIZE: u64 = 4;
 pub const OVERFLOW_ENTRY_SIZE: u64 = 8;
-/// A small entry with this length is a pointer into the overflow table.
+/// A small entry with this length points into the overflow table.
 pub const INVALID_LENGTH: u32 = 0xFF;
 
 pub const Error = error{
-    /// A string section runs past the end of the file.
     TruncatedStringSection,
-    /// A string id is not in the table.
     NoSuchString,
-    /// An entry points outside the string storage buffer.
     BadStringEntry,
 };
 
 pub const Str = struct {
-    /// Raw bytes from the storage buffer. For UTF-16 strings these are
-    /// little-endian code units, so `bytes.len` is twice `len`.
+    /// For UTF-16 these are little-endian code units, so `len` is half of
+    /// `bytes.len`.
     bytes: []const u8,
-    /// Length in code units, as the table records it.
     len: u32,
     is_utf16: bool,
-    /// Whether this string needed an overflow entry.
     overflowed: bool,
 };
 
@@ -94,11 +85,9 @@ pub const Table = struct {
 };
 
 pub const Stats = struct {
-    /// Every string's length added up. This normally *exceeds* the storage
-    /// buffer, and that is not a bug: Hermes lays strings out with a suffix
-    /// array (`StringPacker` in ConsecutiveStringStorage.cpp) so that a string
-    /// which is a suffix of another shares its bytes. The difference is how
-    /// much that packing saved.
+    /// Normally *exceeds* the storage buffer, and that is not a bug: Hermes
+    /// packs strings with a suffix array (ConsecutiveStringStorage.cpp) so a
+    /// string that is a suffix of another shares its bytes.
     sum_of_lengths: u64,
     utf16_strings: u32,
     utf16_bytes: u64,
@@ -132,8 +121,7 @@ pub fn stats(t: Table) Stats {
     return s;
 }
 
-/// Writes a string for human eyes: UTF-16 is decoded per code unit, anything
-/// outside printable ASCII is escaped, and the result is capped at `max` so a
+/// Escapes anything outside printable ASCII and caps the result at `max`, so a
 /// minified blob cannot flood the report.
 pub fn writeEscaped(out: *std.Io.Writer, str: Str, max: usize) !void {
     var written: usize = 0;

@@ -1,10 +1,8 @@
-//! Parser for the Hermes bytecode (HBC) file format.
+//! Parser for the Hermes bytecode (HBC) file format, following
+//! `include/hermes/BCGen/HBC/BytecodeFileFormat.h` in facebook/hermes.
 //!
-//! The layout comes from `include/hermes/BCGen/HBC/BytecodeFileFormat.h` in
-//! facebook/hermes. The structs are `LLVM_PACKED`, and every multi-byte field
-//! is little-endian. We parse field by field on purpose: leaning on the ABI of
-//! an `extern struct` would hide exactly the kind of layout mismatch this tool
-//! exists to find.
+//! Parsed field by field rather than through an `extern struct`: relying on the
+//! compiler's ABI would hide the layout mismatches this tool exists to find.
 
 const std = @import("std");
 
@@ -16,14 +14,11 @@ pub const HEADER_SIZE: usize = 128;
 pub const SHA1_NUM_BYTES: usize = 20;
 pub const FOOTER_SIZE: usize = SHA1_NUM_BYTES;
 
-/// Every section is padded to this before it starts (`pad(BYTECODE_ALIGNMENT)`
-/// in BytecodeStream.cpp).
+/// Each section is padded to this before it starts (BytecodeStream.cpp).
 pub const ALIGNMENT: u64 = 4;
 
-/// The range this parser claims to understand. 96 is current for Hermes
-/// (BytecodeVersion.h, last touched Aug 2023) and is what React Native ships.
-/// Below 90 some fields simply are not in the header, so we refuse rather than
-/// read garbage.
+/// 96 is current for Hermes and is what React Native ships. Below 90 some
+/// header fields do not exist, so we refuse rather than read garbage.
 pub const VERSION_MIN: u32 = 90;
 pub const VERSION_MAX: u32 = 96;
 
@@ -61,13 +56,9 @@ pub const Header = struct {
 };
 
 pub const ParseError = error{
-    /// File is smaller than the 128-byte header.
     TooSmall,
-    /// Not an HBC file at all.
     BadMagic,
-    /// Valid HBC, but in the delta-prepped form — unsupported.
     DeltaPrepped,
-    /// Valid HBC, but a bytecode version outside the range we can read.
     UnsupportedVersion,
 };
 
@@ -146,14 +137,11 @@ pub fn parseHeader(bytes: []const u8) ParseError!Header {
 // Function headers
 // ---------------------------------------------------------------------------
 
-/// A `SmallFuncHeader` is four little-endian words of bitfields. Clang and GCC
-/// allocate C bitfields from the least significant bit on little-endian
-/// targets, which is what `getLargeHeaderOffset()` in the Hermes header relies
-/// on too: it reconstructs a 32-bit value as `(infoOffset << 16) | offset`.
+/// Four little-endian words of bitfields, allocated from the least significant
+/// bit as Clang and GCC do on little-endian targets.
 pub const FUNC_HEADER_SIZE: u64 = 16;
 
-/// The overflow form: the same fields at full width, packed, plus the flags
-/// byte. 7 * u32 + 3 * u8.
+/// The overflow form: same fields at full width, packed. 7 * u32 + 3 * u8.
 pub const LARGE_FUNC_HEADER_SIZE: u64 = 31;
 
 pub const FunctionFlags = packed struct(u8) {
@@ -168,26 +156,21 @@ pub const FunctionFlags = packed struct(u8) {
 
 pub const Function = struct {
     index: u32,
-    /// Byte offset of this function's bytecode within the file.
     offset: u32,
     param_count: u32,
     bytecode_size: u32,
-    /// Index into the string table. Resolving it to text needs the string
-    /// table, which `strings.zig` handles.
+    /// Index into the string table; resolve it with `strings.zig`.
     name_id: u32,
     info_offset: u32,
     frame_size: u32,
     environment_size: u32,
     flags: FunctionFlags,
-    /// True when the small header overflowed and the real values came from a
-    /// large header elsewhere in the file.
+    /// Values came from a large header elsewhere in the file.
     from_large_header: bool,
 };
 
 pub const FunctionError = error{
-    /// The function header table runs past the end of the file.
     TruncatedFunctionTable,
-    /// An overflowed header points outside the file.
     BadLargeHeaderOffset,
 };
 
@@ -195,8 +178,8 @@ pub fn functionTableSize(h: Header) u64 {
     return @as(u64, h.function_count) * FUNC_HEADER_SIZE;
 }
 
-/// Reads one entry of the function header table, following the overflow
-/// indirection when the small header could not hold the real values.
+/// Reads one function header, following the overflow indirection when the
+/// small header could not hold the real values.
 pub fn parseFunction(bytes: []const u8, index: u32) FunctionError!Function {
     const base = HEADER_SIZE + @as(u64, index) * FUNC_HEADER_SIZE;
     if (base + FUNC_HEADER_SIZE > bytes.len) return error.TruncatedFunctionTable;
@@ -224,8 +207,8 @@ pub fn parseFunction(bytes: []const u8, index: u32) FunctionError!Function {
 
     if (!flags.overflowed) return f;
 
-    // The small header stores the large header's offset split across two of
-    // its own fields; see SmallFuncHeader::getLargeHeaderOffset().
+    // The offset is split across two of the small header's own fields; see
+    // SmallFuncHeader::getLargeHeaderOffset().
     const large_at: u64 = (@as(u64, f.info_offset) << 16) | @as(u64, f.offset);
     if (large_at + LARGE_FUNC_HEADER_SIZE > bytes.len) return error.BadLargeHeaderOffset;
 
@@ -244,7 +227,7 @@ pub fn parseFunction(bytes: []const u8, index: u32) FunctionError!Function {
     return f;
 }
 
-/// Reads the whole function header table. Caller owns the returned slice.
+/// Caller owns the returned slice.
 pub fn parseFunctions(
     gpa: std.mem.Allocator,
     bytes: []const u8,
@@ -257,19 +240,17 @@ pub fn parseFunctions(
 }
 
 pub const BytecodeStats = struct {
-    /// Bytes of bytecode counted once per distinct body offset.
+    /// Counted once per distinct body offset.
     distinct_bytes: u64,
-    /// Bytes summed over every function, counting shared bodies repeatedly.
+    /// Summed over every function, counting shared bodies repeatedly.
     total_bytes: u64,
     distinct_bodies: u32,
     overflowed_headers: u32,
 };
 
 /// Hermes deduplicates identical function bodies, so several headers can point
-/// at one offset. Summing `bytecode_size` across all functions therefore
-/// overcounts; `distinct_bytes` is the number that actually fits in the file.
-///
-/// Sorts `scratch` in place; it must be the function list (or a copy of it).
+/// at one offset and summing every `bytecode_size` overcounts. Sorts `scratch`
+/// in place.
 pub fn bytecodeStats(scratch: []Function) BytecodeStats {
     var stats = BytecodeStats{
         .distinct_bytes = 0,
@@ -313,15 +294,8 @@ pub fn alignUp(v: u64) u64 {
     return (v + (ALIGNMENT - 1)) & ~@as(u64, ALIGNMENT - 1);
 }
 
-/// Byte offsets of the sections we need to address directly. The order is
-/// `visitBytecodeSegmentsInOrder()` from BytecodeFileFormat.h, and every
-/// section is preceded by `pad(BYTECODE_ALIGNMENT)`, so each one starts at the
-/// next 4-byte boundary after the previous one ends.
-///
-/// Only the sections up to string storage are computed: everything past it
-/// (array, object, bigint, regexp, CJS and function-source tables) is reported
-/// by size alone and never addressed, so deriving those offsets would be
-/// untested code.
+/// Order follows `visitBytecodeSegmentsInOrder()`. Only the sections up to
+/// string storage are computed; nothing later is ever addressed by offset.
 pub const Layout = struct {
     function_headers: u64,
     string_kinds: u64,
@@ -373,13 +347,8 @@ pub const Section = struct {
 
 pub const SECTION_COUNT = 15;
 
-/// Breaks the file down into what we can state with certainty. Whatever is
-/// left over — function info, exception handlers, jump tables, the bigint,
-/// regexp, CJS and function-source tables, and inter-section padding — is
-/// reported as one honest `rest` bucket by the caller rather than estimated.
-///
-/// Section order follows `visitBytecodeSegmentsInOrder()` in
-/// BytecodeFileFormat.h.
+/// Only what the header states exactly. The caller reports whatever is left
+/// over as one `rest` bucket rather than estimating it.
 pub fn sections(h: Header, bytecode_bytes: u64, buf: *[SECTION_COUNT]Section) []Section {
     const debug_info: u64 = blk: {
         if (h.debug_info_offset == 0) break :blk 0;
@@ -466,8 +435,7 @@ test "reads header fields at the right offsets" {
     try testing.expect(h.options.has_async);
 }
 
-/// Builds a file with one small function header whose bitfields are packed by
-/// hand, so the test fails if the bit layout is ever read wrong.
+/// Packs the bitfields by hand so the test fails if the layout is read wrong.
 fn oneFunctionFile(buf: []u8, w0: u32, w1: u32, w2: u32, w3: u32) void {
     @memset(buf, 0);
     std.mem.writeInt(u64, buf[0..8], MAGIC, .little);
