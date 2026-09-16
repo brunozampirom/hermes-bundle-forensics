@@ -31,6 +31,18 @@ So the fix is not to strip anything. Set `SOURCEMAP_FILE` in the iOS build and
 you get a source map for symbolication *and* drop the bytes, because Sentry and
 Crashlytics read the `.map`, not the section inside the bundle.
 
+Measured on real store artifacts, the asymmetry holds across bytecode lines:
+
+| app | bytecode | Android | iOS | iOS bundle |
+|---|---|---|---|---|
+| Sintonia | 96 | 28 bytes | 1,722,956 bytes | |
+| My Whisky | 98 | 16 bytes | 1,219,676 bytes | 15.0% of it |
+| a React Native 0.86.3 release build, iOS only | 98 | | 314,889 bytes | 16.9% of it |
+
+On My Whisky the debug info is **80% of the entire iOS-versus-Android size
+difference**: the two bundles differ by 1,524,560 bytes and 1,219,660 of those
+are this one section.
+
 ## What it reports
 
 ```
@@ -233,10 +245,8 @@ Three details in the format are easy to read wrong, and each has its own test:
   itself is covered by an end-to-end check that reading from a container gives
   output identical to unzipping first. Building zip fixtures in-process was not
   worth the code.
-- **Validated on two apps' real artifacts**: a matching `.aab` and `.ipa` from
-  one build (bytecode 96), and a React Native 0.86.3 release bundle (bytecode
-  98, where debug info came to 16.9%), plus synthetic bundles from `hermesc` on
-  both lines. Not yet run across a corpus.
+- **Validated on three shipped bundles**, listed below, plus synthetic bundles
+  from `hermesc` on both lines. Still not a corpus.
 
 ## Generating a test bundle
 
