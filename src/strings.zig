@@ -164,3 +164,94 @@ pub fn writeEscaped(out: *std.Io.Writer, str: Str, max: usize) !void {
         written += 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+// Two strings: a plain one, and one whose small entry overflows. The overflow
+// entry's index lives in the small entry's `offset` field, which is the part
+// that reads like a byte offset and is not.
+test "resolves strings through the overflow table" {
+    const storage_at = 144;
+    var b = [_]u8{0} ** (storage_at + 400);
+    std.mem.writeInt(u64, b[0..8], hbc.MAGIC, .little);
+    std.mem.writeInt(u32, b[8..12], 96, .little);
+
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 2;
+    h.overflow_string_count = 1;
+    h.string_storage_size = 305;
+
+    const l = hbc.layout(h);
+    try testing.expectEqual(@as(u64, 128), l.string_table);
+    try testing.expectEqual(@as(u64, 136), l.overflow_string_table);
+    try testing.expectEqual(@as(u64, storage_at), l.string_storage);
+
+    // entry 0: offset 0, length 5, ascii
+    std.mem.writeInt(u32, b[128..][0..4], (5 << 24) | (0 << 1), .little);
+    // entry 1: length 0xFF marks overflow; offset field holds index 0
+    std.mem.writeInt(u32, b[132..][0..4], (0xFF << 24) | (0 << 1), .little);
+    // overflow entry 0: real offset 5, real length 300
+    std.mem.writeInt(u32, b[136..][0..4], 5, .little);
+    std.mem.writeInt(u32, b[140..][0..4], 300, .little);
+    @memcpy(b[storage_at..][0..5], "hello");
+    @memset(b[storage_at + 5 ..][0..300], 'x');
+
+    const t = try Table.init(&b, h);
+
+    const s0 = try t.get(0);
+    try testing.expectEqualStrings("hello", s0.bytes);
+    try testing.expect(!s0.overflowed);
+    try testing.expect(!s0.is_utf16);
+
+    const s1 = try t.get(1);
+    try testing.expectEqual(@as(usize, 300), s1.bytes.len);
+    try testing.expect(s1.overflowed);
+    try testing.expectEqual(@as(u8, 'x'), s1.bytes[0]);
+
+    try testing.expectError(error.NoSuchString, t.get(2));
+
+    const st = stats(t);
+    try testing.expectEqual(@as(u64, 305), st.sum_of_lengths);
+    try testing.expectEqual(@as(u32, 1), st.overflowed);
+    try testing.expectEqual(@as(u32, 0), st.unreadable);
+}
+
+test "utf-16 strings cost two bytes per code unit" {
+    const storage_at = 132;
+    var b = [_]u8{0} ** (storage_at + 16);
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 1;
+    h.string_storage_size = 8;
+
+    // offset 0, length 4 code units, isUTF16 set
+    std.mem.writeInt(u32, b[128..][0..4], (4 << 24) | (0 << 1) | 1, .little);
+    for ([_]u16{ 'a', 'b', 0x00E9, 0x2603 }, 0..) |cu, i| {
+        std.mem.writeInt(u16, b[storage_at + i * 2 ..][0..2], cu, .little);
+    }
+
+    const t = try Table.init(&b, h);
+    const s = try t.get(0);
+    try testing.expect(s.is_utf16);
+    try testing.expectEqual(@as(u32, 4), s.len);
+    try testing.expectEqual(@as(usize, 8), s.bytes.len);
+
+    const st = stats(t);
+    try testing.expectEqual(@as(u64, 8), st.utf16_bytes);
+    try testing.expectEqual(@as(u32, 1), st.utf16_strings);
+}
+
+test "rejects a string entry pointing outside storage" {
+    var b = [_]u8{0} ** 160;
+    var h = std.mem.zeroes(hbc.Header);
+    h.string_count = 1;
+    h.string_storage_size = 4;
+    // offset 2, length 10 -> runs past the 4-byte storage
+    std.mem.writeInt(u32, b[128..][0..4], (10 << 24) | (2 << 1), .little);
+
+    const t = try Table.init(&b, h);
+    try testing.expectError(error.BadStringEntry, t.get(0));
+}

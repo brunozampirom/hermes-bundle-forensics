@@ -121,3 +121,30 @@ pub fn readEntry(
 
     return error.EntryNotFound;
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// The zip reading itself has no unit test: building fixtures in-process was
+// not worth the code. It is covered end to end by checking that reading a
+// bundle from a container gives output identical to unzipping it first.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "detects a zip container by signature, not extension" {
+    try testing.expect(looksLikeZip("PK\x03\x04rest"));
+    try testing.expect(!looksLikeZip("PK\x05\x06")); // empty-archive record
+    try testing.expect(!looksLikeZip(&[_]u8{ 0xC6, 0x1F, 0xBC, 0x03 }));
+    try testing.expect(!looksLikeZip("PK"));
+    try testing.expect(!looksLikeZip(""));
+}
+
+test "recognises bundle paths in each container layout" {
+    try testing.expect(looksLikeBundleName("assets/index.android.bundle"));
+    try testing.expect(looksLikeBundleName("base/assets/index.android.bundle"));
+    try testing.expect(looksLikeBundleName("Payload/Sintonia.app/main.jsbundle"));
+    try testing.expect(looksLikeBundleName("whatever/app.hbc"));
+    try testing.expect(!looksLikeBundleName("res/drawable/icon.png"));
+    try testing.expect(!looksLikeBundleName("AndroidManifest.xml"));
+}

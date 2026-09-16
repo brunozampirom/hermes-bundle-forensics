@@ -414,3 +414,165 @@ pub fn sections(h: Header, bytecode_bytes: u64, buf: *[SECTION_COUNT]Section) []
 
     return buf[0..n];
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "rejects an empty file" {
+    try testing.expectError(error.TooSmall, parseHeader(""));
+}
+
+test "rejects a bad magic" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    try testing.expectError(error.BadMagic, parseHeader(&b));
+    b[0] = 0xFF;
+    try testing.expectError(error.BadMagic, parseHeader(&b));
+}
+
+test "detects delta-prepped" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    std.mem.writeInt(u64, b[0..8], DELTA_MAGIC, .little);
+    try testing.expectError(error.DeltaPrepped, parseHeader(&b));
+}
+
+test "refuses a version outside the supported range" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    std.mem.writeInt(u64, b[0..8], MAGIC, .little);
+    std.mem.writeInt(u32, b[8..12], 42, .little);
+    try testing.expectError(error.UnsupportedVersion, parseHeader(&b));
+}
+
+test "reads header fields at the right offsets" {
+    var b = [_]u8{0} ** HEADER_SIZE;
+    std.mem.writeInt(u64, b[0..8], MAGIC, .little);
+    std.mem.writeInt(u32, b[8..12], 96, .little);
+    b[12] = 0xAB; // first byte of sourceHash
+    std.mem.writeInt(u32, b[32..36], 1234, .little); // fileLength
+    std.mem.writeInt(u32, b[40..44], 77, .little); // functionCount
+    std.mem.writeInt(u32, b[60..64], 999, .little); // stringStorageSize
+    b[108] = 0b101; // staticBuiltins + hasAsync
+
+    const h = try parseHeader(&b);
+    try testing.expectEqual(@as(u32, 96), h.version);
+    try testing.expectEqual(@as(u8, 0xAB), h.source_hash[0]);
+    try testing.expectEqual(@as(u32, 1234), h.file_length);
+    try testing.expectEqual(@as(u32, 77), h.function_count);
+    try testing.expectEqual(@as(u32, 999), h.string_storage_size);
+    try testing.expect(h.options.static_builtins);
+    try testing.expect(!h.options.cjs_modules_statically_resolved);
+    try testing.expect(h.options.has_async);
+}
+
+/// Builds a file with one small function header whose bitfields are packed by
+/// hand, so the test fails if the bit layout is ever read wrong.
+fn oneFunctionFile(buf: []u8, w0: u32, w1: u32, w2: u32, w3: u32) void {
+    @memset(buf, 0);
+    std.mem.writeInt(u64, buf[0..8], MAGIC, .little);
+    std.mem.writeInt(u32, buf[8..12], 96, .little);
+    std.mem.writeInt(u32, buf[40..44], 1, .little); // functionCount
+    std.mem.writeInt(u32, buf[128..][0..4], w0, .little);
+    std.mem.writeInt(u32, buf[132..][0..4], w1, .little);
+    std.mem.writeInt(u32, buf[136..][0..4], w2, .little);
+    std.mem.writeInt(u32, buf[140..][0..4], w3, .little);
+}
+
+test "unpacks small function header bitfields" {
+    var b = [_]u8{0} ** (HEADER_SIZE + 16);
+    oneFunctionFile(
+        &b,
+        (3 << 25) | 0x0012_3456, // paramCount 3, offset 0x123456
+        (777 << 15) | 0x1234, // functionName 777, bytecodeSize 0x1234
+        (9 << 25) | 0x0000_ABCD, // frameSize 9, infoOffset 0xABCD
+        // flags: strictMode (bit 2) + hasExceptionHandler (bit 3).
+        (0b00_1100 << 24) | (5 << 16) | (4 << 8) | 42,
+    );
+
+    const f = try parseFunction(&b, 0);
+    try testing.expectEqual(@as(u32, 0x0012_3456), f.offset);
+    try testing.expectEqual(@as(u32, 3), f.param_count);
+    try testing.expectEqual(@as(u32, 0x1234), f.bytecode_size);
+    try testing.expectEqual(@as(u32, 777), f.name_id);
+    try testing.expectEqual(@as(u32, 0x0000_ABCD), f.info_offset);
+    try testing.expectEqual(@as(u32, 9), f.frame_size);
+    try testing.expectEqual(@as(u32, 42), f.environment_size);
+    try testing.expect(f.flags.strict_mode);
+    try testing.expect(f.flags.has_exception_handler);
+    try testing.expect(!f.flags.overflowed);
+    try testing.expect(!f.from_large_header);
+}
+
+test "follows an overflowed function header" {
+    const large_at = 200;
+    var b = [_]u8{0} ** (large_at + 64);
+    // The overflowed bit is bit 5 of the flags byte; the large header offset
+    // is split as (infoOffset << 16) | offset.
+    oneFunctionFile(
+        &b,
+        large_at & 0xFFFF,
+        0,
+        large_at >> 16,
+        0b10_0000 << 24,
+    );
+    var c: usize = large_at;
+    for ([_]u32{ 0xDEAD, 11, 70_000, 90_000, 0xBEEF, 22, 33 }) |v| {
+        std.mem.writeInt(u32, b[c..][0..4], v, .little);
+        c += 4;
+    }
+
+    const f = try parseFunction(&b, 0);
+    try testing.expect(f.from_large_header);
+    try testing.expectEqual(@as(u32, 0xDEAD), f.offset);
+    try testing.expectEqual(@as(u32, 11), f.param_count);
+    // Both exceed what the small header's 15 and 17 bits could hold.
+    try testing.expectEqual(@as(u32, 70_000), f.bytecode_size);
+    try testing.expectEqual(@as(u32, 90_000), f.name_id);
+}
+
+test "rejects a truncated function table" {
+    var b = [_]u8{0} ** (HEADER_SIZE + 8); // room for half an entry
+    std.mem.writeInt(u64, b[0..8], MAGIC, .little);
+    std.mem.writeInt(u32, b[8..12], 96, .little);
+    std.mem.writeInt(u32, b[40..44], 1, .little);
+    try testing.expectError(error.TruncatedFunctionTable, parseFunction(&b, 0));
+}
+
+test "counts shared function bodies once" {
+    const blank: FunctionFlags = @bitCast(@as(u8, 0));
+    var fns = [_]Function{
+        .{ .index = 0, .offset = 100, .param_count = 0, .bytecode_size = 10, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = blank, .from_large_header = false },
+        .{ .index = 1, .offset = 100, .param_count = 0, .bytecode_size = 10, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = blank, .from_large_header = false },
+        .{ .index = 2, .offset = 200, .param_count = 0, .bytecode_size = 25, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = blank, .from_large_header = false },
+    };
+
+    const st = bytecodeStats(&fns);
+    try testing.expectEqual(@as(u64, 45), st.total_bytes);
+    try testing.expectEqual(@as(u64, 35), st.distinct_bytes);
+    try testing.expectEqual(@as(u32, 2), st.distinct_bodies);
+}
+
+test "alignUp rounds to the next 4-byte boundary" {
+    try testing.expectEqual(@as(u64, 0), alignUp(0));
+    try testing.expectEqual(@as(u64, 4), alignUp(1));
+    try testing.expectEqual(@as(u64, 4), alignUp(4));
+    try testing.expectEqual(@as(u64, 8), alignUp(5));
+}
+
+test "section layout pads each section to 4 bytes" {
+    var h = std.mem.zeroes(Header);
+    h.function_count = 1; // 16 bytes, already aligned
+    h.string_kind_count = 1; // 4 bytes
+    h.identifier_count = 1; // 4 bytes
+    h.string_count = 3; // 12 bytes
+    h.overflow_string_count = 1; // 8 bytes
+
+    const l = layout(h);
+    try testing.expectEqual(@as(u64, 128), l.function_headers);
+    try testing.expectEqual(@as(u64, 144), l.string_kinds);
+    try testing.expectEqual(@as(u64, 148), l.identifier_hashes);
+    try testing.expectEqual(@as(u64, 152), l.string_table);
+    try testing.expectEqual(@as(u64, 164), l.overflow_string_table);
+    try testing.expectEqual(@as(u64, 172), l.string_storage);
+}
