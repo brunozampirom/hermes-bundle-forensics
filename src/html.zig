@@ -73,10 +73,14 @@ pub fn writeDiff(
     root: tree.DiffNode,
 ) !void {
     try out.writeAll(head);
-    try out.writeAll("<h1>");
+    try out.writeAll("<h1 title=\"");
     try writeHtmlText(out, label_b);
-    try out.writeAll("</h1>\n<p class=\"sub\">compared against ");
+    try out.writeAll("\">");
+    try writeShortLabel(out, label_b);
+    try out.writeAll("</h1>\n<p class=\"sub\" title=\"");
     try writeHtmlText(out, label_a);
+    try out.writeAll("\">compared against ");
+    try writeShortLabel(out, label_a);
     try out.print(" &middot; {d} to {d} bytes", .{ root.a_bytes, root.b_bytes });
     try out.writeAll("</p>\n");
     try out.writeAll(body);
@@ -88,8 +92,10 @@ pub fn writeDiff(
 
 pub fn write(out: *Io.Writer, label: []const u8, version: u32, root: tree.Node) !void {
     try out.writeAll(head);
-    try out.writeAll("<h1>");
+    try out.writeAll("<h1 title=\"");
     try writeHtmlText(out, label);
+    try out.writeAll("\">");
+    try writeShortLabel(out, label);
     try out.writeAll("</h1>\n<p class=\"sub\">");
     try out.print("{d} bytes &middot; bytecode version {d}", .{ root.bytes, version });
     try out.writeAll("</p>\n");
@@ -98,6 +104,24 @@ pub fn write(out: *Io.Writer, label: []const u8, version: u32, root: tree.Node) 
     try writeNode(out, root);
     try out.writeAll(";\n");
     try out.writeAll(script);
+}
+
+/// A label is a full path, often with a container entry after `!`, and the
+/// heading only needs enough of it to tell two artifacts apart. The whole
+/// thing stays in the tooltip.
+fn writeShortLabel(out: *Io.Writer, label: []const u8) !void {
+    const bang = std.mem.indexOfScalar(u8, label, '!');
+    const left = if (bang) |i| label[0..i] else label;
+    try writeHtmlText(out, basename(left));
+    if (bang) |i| {
+        try out.writeByte('!');
+        try writeHtmlText(out, basename(label[i + 1 ..]));
+    }
+}
+
+fn basename(p: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfAny(u8, p, "/\\") orelse return p;
+    return p[slash + 1 ..];
 }
 
 fn writeHtmlText(out: *Io.Writer, s: []const u8) !void {
@@ -126,17 +150,24 @@ const head =
     \\body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
     \\       font:14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     \\h1 { font-size:15px; font-weight:600; margin:0; word-break:break-all; }
-    \\.sub { color:var(--muted); margin:4px 0 12px; }
+    \\/* A diff subtitle carries two file paths, and a path has nowhere to wrap. */
+    \\.sub { color:var(--muted); margin:4px 0 12px; word-break:break-all; }
     \\#crumbs { margin-bottom:8px; min-height:22px; }
     \\#crumbs button { font:inherit; background:none; border:0; padding:2px 4px;
     \\                 color:var(--fg); cursor:pointer; text-decoration:underline; }
     \\#crumbs span { color:var(--muted); }
     \\#map { position:relative; width:100%; height:70vh; min-height:360px;
     \\       border:1px solid var(--line); overflow:hidden; }
-    \\.tile { position:absolute; overflow:hidden; border:1px solid rgba(0,0,0,.35);
-    \\        padding:3px 5px; font-size:11px; line-height:1.25; cursor:default; }
+    \\/* An inset shadow rather than a border, and padding only on tiles that
+    \\   carry a label. Both take space a small tile does not have, and a tile
+    \\   drawn larger than its share is a treemap telling a lie. */
+    \\.tile { position:absolute; overflow:hidden; font-size:11px; line-height:1.25;
+    \\        cursor:default; box-shadow: inset 0 0 0 1px rgba(0,0,0,.35); }
+    \\.tile.lbl { padding:3px 5px; }
     \\.tile.has-kids { cursor:pointer; }
-    \\.tile b { font-weight:600; display:block; word-break:break-all; }
+    \\/* anywhere, not break-all: break inside a word only when there is no
+    \\   space to break at, so "array buffer" does not become "array buf fer". */
+    \\.tile b { font-weight:600; display:block; overflow-wrap:anywhere; }
     \\.tile i { font-style:normal; opacity:.75; }
     \\#tip { position:fixed; z-index:9; max-width:min(70vw,520px); padding:6px 8px;
     \\       background:var(--bg); color:var(--fg); border:1px solid var(--line);
@@ -190,8 +221,11 @@ const script =
     \\  if (d === 0) return ['hsl(0 0% 62%)', '#111'];
     \\  const base = node.a > 0 ? node.a : node.b;
     \\  const share = Math.min(Math.abs(d) / base, 1);
-    \\  const light = 72 - share * 32;
-    \\  return ['hsl(' + (d > 0 ? 8 : 145) + ' 60% ' + light + '%)',
+    \\  // Saturation as well as lightness, or a two byte change looks as
+    \\  // alarming as a doubling and only slightly paler.
+    \\  const sat = 10 + share * 58;
+    \\  const light = 74 - share * 34;
+    \\  return ['hsl(' + (d > 0 ? 8 : 145) + ' ' + sat + '% ' + light + '%)',
     \\          light < 50 ? '#fff' : '#111'];
     \\}
     \\
@@ -287,6 +321,7 @@ const script =
     \\    el.style.background = paint[0];
     \\    el.style.color = paint[1];
     \\    if (r.w > 60 && r.h > 26) {
+    \\      el.classList.add('lbl');
     \\      el.innerHTML = '<b></b><i></i>';
     \\      el.querySelector('b').textContent = r.node.n;
     \\      el.querySelector('i').textContent = fmt(r.node.b) + '  ' + pct(r.node.b, node.b);
@@ -315,7 +350,10 @@ const script =
     \\
     \\  const gone = kids.filter(k => k.b === 0 && k.a > 0).sort((x, y) => y.a - x.a);
     \\  if (!gone.length) {
-    \\    box.innerHTML = '<div id="legend">no entries left ' + parent.n + '</div>';
+    \\    const d = document.createElement('div');
+    \\    d.className = 'note';
+    \\    d.textContent = 'nothing was dropped from ' + parent.n;
+    \\    box.appendChild(d);
     \\    return;
     \\  }
     \\
