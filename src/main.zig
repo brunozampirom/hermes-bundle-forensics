@@ -668,13 +668,18 @@ fn reportDiff(out: *Io.Writer, gpa: std.mem.Allocator, a: Bundle, b: Bundle, top
         if (sa.bytes == 0 and sb.bytes == 0) continue;
         try printDelta(out, sa.name, sa.bytes, sb.bytes);
     }
-    // Without this the deltas quietly fail to add up to the total.
-    try printDelta(
-        out,
-        "rest (info + padding)",
-        if (a.bytes.len > a_known) a.bytes.len - a_known else 0,
-        if (b.bytes.len > b_known) b.bytes.len - b_known else 0,
-    );
+    // Without this the deltas quietly fail to add up to the total. An overshoot
+    // is called out rather than clamped, for the reason given in reportFile.
+    if (a_known > a.bytes.len or b_known > b.bytes.len) {
+        try out.print("  {s:<30} sections overrun the file\n", .{"INCONSISTENT"});
+    } else {
+        try printDelta(
+            out,
+            "rest (info + padding)",
+            a.bytes.len - a_known,
+            b.bytes.len - b_known,
+        );
+    }
 
     try out.print("\ncounts\n", .{});
     try printDelta(out, "functions", a.header.function_count, b.header.function_count);
@@ -863,13 +868,21 @@ fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
     var buf: [hbc.SECTION_COUNT]hbc.Section = undefined;
     const secs = hbc.sections(h, stats.distinct_bytes, stats.overflowed_headers, &buf);
 
-    var known: u64 = 0;
-    for (secs) |s| known += s.bytes;
+    const known = hbc.sectionSum(secs);
 
     for (secs) |s| try printSection(out, s.name, s.bytes, file_size);
 
-    const rest = if (file_size > known) file_size - known else 0;
-    try printSection(out, "rest (info + padding)", rest, file_size);
+    // Each section is sized from the header independently, so the sum landing
+    // inside the file is a real property rather than an identity. Clamping an
+    // overshoot to zero would hide the one bug worth catching here: a mis-sized
+    // section then reads as a tidy report with a slightly smaller rest.
+    if (known > file_size) {
+        try out.print("  {s:<30} {d:>12}  sections overrun the file by {d}\n", .{
+            "INCONSISTENT", known, known - file_size,
+        });
+    } else {
+        try printSection(out, "rest (info + padding)", file_size - known, file_size);
+    }
 
     if (top > 0 and functions.len > 0) try reportTopFunctions(out, functions, table, top);
     if (top > 0) {

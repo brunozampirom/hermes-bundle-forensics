@@ -464,6 +464,16 @@ pub const Section = struct {
 
 pub const SECTION_COUNT = 16;
 
+/// Total the sections account for. A sum past the end of the file means a
+/// section was mis-sized, which is worth saying out loud: the alternative is
+/// subtracting it from the leftover bucket and printing a report that looks
+/// fine.
+pub fn sectionSum(secs: []const Section) u64 {
+    var total: u64 = 0;
+    for (secs) |s| total += s.bytes;
+    return total;
+}
+
 /// Only what the header states exactly. The caller reports whatever is left
 /// over as one `rest` bucket rather than estimating it.
 pub fn sections(
@@ -680,6 +690,29 @@ test "section layout pads each section to 4 bytes" {
     try testing.expectEqual(@as(u64, 152), l.string_table);
     try testing.expectEqual(@as(u64, 164), l.overflow_string_table);
     try testing.expectEqual(@as(u64, 172), l.string_storage);
+}
+
+test "the section sum is a real check, not the leftover bucket" {
+    var h = std.mem.zeroes(Header);
+    h.function_count = 1;
+    h.string_kind_count = 1;
+    h.identifier_count = 1;
+    h.string_count = 3;
+    h.overflow_string_count = 1;
+    h.string_storage_size = 40;
+
+    var buf: [SECTION_COUNT]Section = undefined;
+    const fits = sectionSum(sections(h, 64, 0, &buf));
+
+    // 128 header + 16 + 4 + 4 + 12 + 8 + 40 storage + 64 bytecode + 20 footer.
+    try testing.expectEqual(@as(u64, 296), fits);
+
+    // A file that small cannot hold them, and the caller must be able to tell.
+    // Before this the overshoot was clamped away and the report read as clean.
+    try testing.expect(fits > 200);
+
+    const bigger = sectionSum(sections(h, 4096, 0, &buf));
+    try testing.expectEqual(fits + 4096 - 64, bigger);
 }
 
 // --- static_h line ---------------------------------------------------------
