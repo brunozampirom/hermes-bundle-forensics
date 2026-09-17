@@ -302,6 +302,16 @@ final shipped bundle". What was missing is any way to see how much, on your
 bundle. Metro reports one number per platform and stops there, so a documented
 cost stays invisible until something opens the file and counts.
 
+The engine's own forum shows what answering this costs without the file. In
+[facebook/hermes discussion #1129](https://github.com/facebook/hermes/discussions/1129),
+"How to check if Hermes bytecode bundle contains debug info?", the accepted
+answer explains what each `-g` level emits, then concludes that to tell `-g1`
+from `-output-source-map` from inside the bundle you "construct an instance of
+`Error()` and examine its `.stack` property". That works. It also needs the app
+built, installed, running and throwing, and at the end of it you know which mode
+you are in but not what it cost you. Reading the header answers both in
+milliseconds, before the app exists.
+
 The cause is a default that differs by platform. `-output-source-map` moves the
 debug info out of the bundle and into the `.map`, and React Native passes it on
 one platform but not the other:
