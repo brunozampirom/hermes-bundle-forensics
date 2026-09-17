@@ -72,11 +72,19 @@ pub fn main(init: std.process.Init) !void {
     if (args.path_b) |pb| {
         const b = try open(arena, io, out, args, pb, args.entry_b);
         try reportDiff(out, arena, a, b, args.top);
+        if (args.html) |dest| {
+            // reportDiff refuses to compare across bytecode lines. Drawing what
+            // the table declined to print would be worse for being prettier.
+            if (comparable(a, b)) {
+                try writeDiffTreemap(arena, io, out, a, b, dest);
+            } else {
+                try out.print("no treemap written; the bundles are different format lines\n", .{});
+            }
+        }
     } else {
         try report(out, a, args.top);
+        if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
     }
-
-    if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
 
     if (args.budget) |path| {
         const code = try runBudget(arena, io, out, a, path);
@@ -85,6 +93,37 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     try out.flush();
+}
+
+/// The two bytecode lines name different sections in the same slots, so any
+/// side by side view of them labels a row from one side and fills it from the
+/// other.
+fn comparable(a: Bundle, b: Bundle) bool {
+    return hbc.Format.forVersion(a.header.version) ==
+        hbc.Format.forVersion(b.header.version);
+}
+
+fn writeDiffTreemap(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    a: Bundle,
+    b: Bundle,
+    dest: []const u8,
+) !void {
+    const ta = try tree.build(arena, a.header, a.functions, a.table, a.bytes.len, .{});
+    const tb = try tree.build(arena, b.header, b.functions, b.table, b.bytes.len, .{});
+    const d = try tree.diff(arena, ta, tb);
+
+    const file = try Io.Dir.cwd().createFile(io, dest, .{});
+    defer file.close(io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try html.writeDiff(&writer.interface, a.label, b.label, d);
+    try writer.interface.flush();
+
+    try out.print("\ndiff treemap written to {s}\n", .{dest});
 }
 
 /// Checks a bundle against a budget file and returns the process exit code.

@@ -49,6 +49,43 @@ fn writeNode(out: *Io.Writer, node: tree.Node) !void {
     try out.writeByte('}');
 }
 
+fn writeDiffNode(out: *Io.Writer, node: tree.DiffNode) !void {
+    try out.writeAll("{\"n\":\"");
+    try writeJsonString(out, node.name);
+    try out.print("\",\"b\":{d},\"a\":{d}", .{ node.b_bytes, node.a_bytes });
+    if (node.children.len > 0) {
+        try out.writeAll(",\"c\":[");
+        for (node.children, 0..) |c, i| {
+            if (i > 0) try out.writeByte(0x2C);
+            try writeDiffNode(out, c);
+        }
+        try out.writeByte(0x5d);
+    }
+    try out.writeByte(0x7d);
+}
+
+/// Tiles are sized by the second bundle, so they still partition it. What is
+/// only in the first has no area and the page lists it under the map instead.
+pub fn writeDiff(
+    out: *Io.Writer,
+    label_a: []const u8,
+    label_b: []const u8,
+    root: tree.DiffNode,
+) !void {
+    try out.writeAll(head);
+    try out.writeAll("<h1>");
+    try writeHtmlText(out, label_b);
+    try out.writeAll("</h1>\n<p class=\"sub\">compared against ");
+    try writeHtmlText(out, label_a);
+    try out.print(" &middot; {d} to {d} bytes", .{ root.a_bytes, root.b_bytes });
+    try out.writeAll("</p>\n");
+    try out.writeAll(body);
+    try out.writeAll("<script>\nconst DATA = ");
+    try writeDiffNode(out, root);
+    try out.writeAll(";\n");
+    try out.writeAll(script);
+}
+
 pub fn write(out: *Io.Writer, label: []const u8, version: u32, root: tree.Node) !void {
     try out.writeAll(head);
     try out.writeAll("<h1>");
@@ -104,6 +141,12 @@ const head =
     \\#tip { position:fixed; z-index:9; max-width:min(70vw,520px); padding:6px 8px;
     \\       background:var(--bg); color:var(--fg); border:1px solid var(--line);
     \\       font-size:12px; pointer-events:none; display:none; word-break:break-all; }
+    \\#removed { margin-top:12px; font-size:12px; }
+    \\#removed h2 { font-size:12px; font-weight:600; margin:0 0 4px; }
+    \\#removed div { color:var(--muted); word-break:break-all; }
+    \\#legend { margin-top:8px; font-size:12px; color:var(--muted); }
+    \\#legend span { display:inline-block; width:10px; height:10px; margin:0 4px 0 12px;
+    \\               vertical-align:middle; border:1px solid rgba(0,0,0,.3); }
     \\</style>
     \\</head>
     \\<body>
@@ -113,6 +156,7 @@ const head =
 const body =
     \\<div id="crumbs"></div>
     \\<div id="map"></div>
+    \\<div id="removed"></div>
     \\<div id="tip"></div>
     \\
 ;
@@ -126,10 +170,38 @@ const script =
     \\const fmt = n => n.toLocaleString('en-US');
     \\const pct = (a, b) => b > 0 ? (a / b * 100).toFixed(1) + '%' : '0%';
     \\
+    \\// A diff node carries the old size as well, which is the only difference
+    \\// between the two pages and keeps this to one code path.
+    \\const isDiff = DATA.a !== undefined;
+    \\
     \\function hue(name) {
     \\  let h = 0;
     \\  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
     \\  return h % 360;
+    \\}
+    \\
+    \\// In diff mode colour carries the delta, so it cannot also carry identity.
+    \\function fill(node, hasKids) {
+    \\  if (!isDiff) {
+    \\    const l = hasKids ? 42 : 58;
+    \\    return ['hsl(' + hue(node.n) + ' 55% ' + l + '%)', l < 50 ? '#fff' : '#111'];
+    \\  }
+    \\  const d = node.b - node.a;
+    \\  if (d === 0) return ['hsl(0 0% 62%)', '#111'];
+    \\  const base = node.a > 0 ? node.a : node.b;
+    \\  const share = Math.min(Math.abs(d) / base, 1);
+    \\  const light = 72 - share * 32;
+    \\  return ['hsl(' + (d > 0 ? 8 : 145) + ' 60% ' + light + '%)',
+    \\          light < 50 ? '#fff' : '#111'];
+    \\}
+    \\
+    \\function describe(node, parent) {
+    \\  const own = fmt(node.b) + ' bytes, ' + pct(node.b, parent.b) + ' of ' + parent.n;
+    \\  if (!isDiff) return node.n + ' - ' + own + ', ' + pct(node.b, DATA.b) + ' of file';
+    \\  const d = node.b - node.a;
+    \\  const sign = d > 0 ? '+' : '';
+    \\  return node.n + ' - ' + fmt(node.a) + ' to ' + fmt(node.b) +
+    \\    ' bytes (' + sign + fmt(d) + '), ' + pct(node.b, parent.b) + ' of ' + parent.n;
     \\}
     \\
     \\// Squarified treemap: keep each row's tiles as close to square as possible,
@@ -211,9 +283,9 @@ const script =
     \\    el.style.top = r.y + 'px';
     \\    el.style.width = r.w + 'px';
     \\    el.style.height = r.h + 'px';
-    \\    const l = r.node.c ? 42 : 58;
-    \\    el.style.background = 'hsl(' + hue(r.node.n) + ' 55% ' + l + '%)';
-    \\    el.style.color = l < 50 ? '#fff' : '#111';
+    \\    const paint = fill(r.node, !!r.node.c);
+    \\    el.style.background = paint[0];
+    \\    el.style.color = paint[1];
     \\    if (r.w > 60 && r.h > 26) {
     \\      el.innerHTML = '<b></b><i></i>';
     \\      el.querySelector('b').textContent = r.node.n;
@@ -223,13 +295,55 @@ const script =
     \\      tip.style.display = 'block';
     \\      tip.style.left = Math.min(e.clientX + 12, innerWidth - 540) + 'px';
     \\      tip.style.top = (e.clientY + 14) + 'px';
-    \\      tip.textContent = r.node.n + ' - ' + fmt(r.node.b) + ' bytes, ' +
-    \\        pct(r.node.b, node.b) + ' of ' + node.n + ', ' + pct(r.node.b, total) + ' of file';
+    \\      tip.textContent = describe(r.node, node);
     \\    };
     \\    el.onmouseleave = () => { tip.style.display = 'none'; };
     \\    if (r.node.c) el.onclick = () => { path.push(r.node); tip.style.display = 'none'; draw(); };
     \\    map.appendChild(el);
     \\  }
+    \\
+    \\  drawGone(kids, node);
+    \\}
+    \\
+    \\// A node the second bundle no longer has is zero bytes, so it has no tile.
+    \\// Dropping it from the page entirely would hide the thing someone removing
+    \\// code most wants to see, so it goes in a list under the map.
+    \\function drawGone(kids, parent) {
+    \\  const box = document.getElementById('removed');
+    \\  box.innerHTML = '';
+    \\  if (!isDiff) return;
+    \\
+    \\  const gone = kids.filter(k => k.b === 0 && k.a > 0).sort((x, y) => y.a - x.a);
+    \\  if (!gone.length) {
+    \\    box.innerHTML = '<div id="legend">no entries left ' + parent.n + '</div>';
+    \\    return;
+    \\  }
+    \\
+    \\  const h = document.createElement('h2');
+    \\  const total = gone.reduce((s, g) => s + g.a, 0);
+    \\  h.textContent = 'gone from ' + parent.n + ': ' + gone.length + ' entries, ' +
+    \\    fmt(total) + ' bytes';
+    \\  box.appendChild(h);
+    \\  for (const g of gone.slice(0, 40)) {
+    \\    const d = document.createElement('div');
+    \\    d.textContent = '-' + fmt(g.a) + '  ' + g.n;
+    \\    box.appendChild(d);
+    \\  }
+    \\  if (gone.length > 40) {
+    \\    const d = document.createElement('div');
+    \\    d.textContent = 'and ' + (gone.length - 40) + ' more';
+    \\    box.appendChild(d);
+    \\  }
+    \\}
+    \\
+    \\if (isDiff) {
+    \\  const l = document.createElement('div');
+    \\  l.id = 'legend';
+    \\  l.innerHTML = 'area is the new bundle' +
+    \\    '<span style="background:hsl(8 60% 55%)"></span>grew' +
+    \\    '<span style="background:hsl(145 60% 55%)"></span>shrank' +
+    \\    '<span style="background:hsl(0 0% 62%)"></span>unchanged';
+    \\  crumbs.parentNode.insertBefore(l, crumbs);
     \\}
     \\
     \\addEventListener('resize', draw);
