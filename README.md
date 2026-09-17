@@ -41,15 +41,25 @@ Crashlytics read the `.map`, not the section inside the bundle.
 
 Measured on real store artifacts, the asymmetry holds across bytecode lines:
 
-| app | bytecode | Android | iOS | iOS bundle |
+| bundle | bytecode | Android | iOS | share of the iOS bundle |
 |---|---|---|---|---|
 | Sintonia | 96 | 28 bytes | 1,722,956 bytes | |
-| My Whisky | 98 | 16 bytes | 1,219,676 bytes | 15.0% of it |
-| a React Native 0.86.3 release build, iOS only | 98 | | 314,889 bytes | 16.9% of it |
+| My Whisky | 98 | 16 bytes | 1,219,676 bytes | 15.0% |
+| **a stock `expo prebuild` app, nothing configured** | 98 | | 314,889 bytes | **16.9%** |
 
 On My Whisky the debug info is **80% of the entire iOS-versus-Android size
 difference**: the two bundles differ by 1,524,560 bytes and 1,219,660 of those
 are this one section.
+
+The third row is the one that matters. It is a template app created with
+`npx expo prebuild` and built with `xcodebuild`, with nothing configured by
+anyone. This is not a misconfiguration in someone's project; it is what the
+default does.
+
+It is not universal, though. Anyone who follows the Sentry, Bugsnag or
+Crashlytics setup guides sets `SOURCEMAP_FILE` and is already on the other side
+of this. The affected set is iOS builds with no source map upload configured,
+which is the default rather than the exception.
 
 ## What it reports
 
