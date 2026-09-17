@@ -169,6 +169,7 @@ hbcinfo [options] <file> [file-b]
   --top N        list the N largest functions and strings (default 10, 0 skips)
   --entry PATH   which bundle to read, when a container holds several
   --entry-b PATH same, for the second file in a diff
+  --html PATH    write a treemap of the bundle to PATH as one html file
   --list         list the bundles in a container and exit
 ```
 
@@ -176,6 +177,39 @@ Containers are detected by the `PK\x03\x04` signature, not by extension. A
 container holding several bundles (split APKs, multi-module AABs) is an error
 rather than a silent pick, since which one the numbers describe would otherwise
 be a guess.
+
+## The treemap
+
+```sh
+hbcinfo --html bundle.html app-release.aab
+```
+
+One self-contained file: no CDN, no bundler, no server. It opens offline and
+can be attached to a build artifact or a pull request.
+
+This is not a second [Expo Atlas](https://github.com/expo/atlas). Atlas reads
+Metro's dependency graph, so it knows which module contributed which JavaScript
+and stops where Hermes begins. This starts at the shipped bytecode and has no
+idea modules ever existed. The sections it draws, function bytecode, string
+storage, the overflow headers, debug info, are the ones Atlas structurally
+cannot see. Anyone shrinking a bundle wants both.
+
+Two details in it are not obvious:
+
+**Function tiles are distinct bodies, not headers.** Hermes shares identical
+bodies between functions, so drawing one tile per header would invent bytes the
+file does not contain. A shared body is drawn once and says how many headers
+point at it.
+
+**String tiles are sized by the bytes a string alone keeps alive.** Because
+Hermes packs strings with a suffix array, their lengths add up to more than the
+buffer holds, so sizing tiles by length would draw children overflowing their
+parent. Every byte of storage is instead given to exactly one string, longest
+first, and a string fully contained in another correctly costs nothing. The
+tiles then sum to the storage the file actually spends.
+
+That reconciliation is a test, not a claim: every node's children sum to the
+node, at every level, down to the byte.
 
 ## Scope
 
