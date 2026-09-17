@@ -211,6 +211,50 @@ tiles then sum to the storage the file actually spends.
 That reconciliation is a test, not a claim: every node's children sum to the
 node, at every level, down to the byte.
 
+### Diffing two bundles visually
+
+```sh
+hbcinfo --html grew.html old.aab new.aab
+```
+
+Tiles are sized by the new bundle, so they still partition it, and coloured by
+the delta. Something the new bundle no longer has is zero bytes and therefore
+has no tile, so it is listed under the map rather than dropped from the page.
+
+Entries are matched by name, and names are not unique: 118 of the 301 largest
+functions in a real bundle are called `(anonymous)`. Nothing distinguishes them
+across builds, so everything sharing a name is summed into one entry labelled
+with its count. That is less precise than pretending each one matched, and it
+is the only honest option.
+
+The text diff refuses to compare bundles from the two bytecode lines, because
+their section tables do not line up. The treemap refuses the same comparison. A
+picture of a table the tool declined to print would be worse for being prettier.
+
+## Budgets
+
+```sh
+hbcinfo --budget budget.txt app-release.aab
+```
+
+```
+# bytes. a section missing here is not checked
+total          = 4_000_000
+debug info     = 1024
+string storage = 900_000
+```
+
+Over budget exits 1, which is the whole point. Budgets are per section rather
+than one total, because "the bundle grew 40 KB" is not something anyone can act
+on, while "debug info came back" is. The finding this tool was written for is a
+section that should be 28 bytes and was 1.7 MB; a total-only budget absorbs
+that inside normal release-to-release drift.
+
+A name matching no section fails the run rather than passing quietly. A budget
+file that silently checks nothing because of a typo is the failure worth
+designing against, since it only shows up as the regression it was meant to
+catch.
+
 ## Scope
 
 **Bytecode versions 90-99**, across the two lines that are actually in the wild.
