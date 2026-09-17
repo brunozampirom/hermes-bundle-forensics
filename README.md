@@ -477,16 +477,6 @@ Three details in the format are easy to read wrong, and each has its own test:
 - **Deduplicated function bodies are counted once.** Hermes shares identical
   bodies between headers, so summing every function's size overcounts, by
   80 KB on the bundle above.
-- **The two treemap images are screenshots.** Everything else here is checked
-  against the data it came from, but those two PNGs are not: they were taken by
-  hand from `--html` output on a real bundle, which cannot be committed. If the
-  rendering changes they go stale and nothing fails. The page itself is covered
-  by tests, so what is unguarded is the picture in this file, not the feature.
-
-- **The container path has no unit tests.** Its pure helpers do; the zip reading
-  itself is covered by an end-to-end check that reading from a container gives
-  output identical to unzipping first. Building zip fixtures in-process was not
-  worth the code.
 - **Validated on three shipped bundles**, listed below, plus synthetic bundles
   from `hermesc` on both lines. Still not a corpus.
 
