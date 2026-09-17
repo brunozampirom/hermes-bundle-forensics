@@ -11,8 +11,16 @@ one build:
 ```
 
 The iOS bundle is 1.93 MB larger than the Android one, and **1.72 MB of that is
-Hermes debug info the release build kept**. Metro reports one bundle size per
-platform and stops there; nothing in the JS toolchain points at the line above.
+Hermes debug info the release build kept**.
+
+None of that is new behaviour, and this tool did not discover it. Sentry's
+[source map docs](https://docs.sentry.io/platforms/react-native/sourcemaps/uploading/hermes/)
+state the mechanism plainly: generating Hermes source maps "has a side effect of
+striping the debug information, saving it to the source map" (their typo), and
+"the debug information included in the Hermes bundle increases the size of the
+final shipped bundle". What was missing is any way to see how much, on your
+bundle. Metro reports one number per platform and stops there, so a documented
+cost stays invisible until something opens the file and counts.
 
 The cause is a default that differs by platform. `-output-source-map` moves the
 debug info out of the bundle and into the `.map`, and React Native passes it on
