@@ -240,6 +240,19 @@ its files.
 The two lines at the top of that measurement are both React renderers, Fabric
 and the old one, together 166 KB of a 3.7 MB bundle.
 
+### This is not source-map-explorer
+
+`source-map-explorer` and `react-native-bundle-visualizer` answer the same
+question about a different file. They attribute bytes of the **JavaScript**
+Metro emitted. This attributes bytes of the **bytecode** Hermes compiled, which
+is the thing that ships.
+
+The two disagree, and not by a rounding error. Compilation, minification and
+Hermes deduplicating identical function bodies all land unevenly across
+modules, so a dependency that is large in JavaScript can be small in bytecode
+and the other way round. If the question is which dependency to cut from the
+app, the answer has to come from the artifact the user downloads.
+
 ### What it needs, and what it does not
 
 **The source map, not the bundle's debug info.** Those two are mutually
@@ -333,6 +346,25 @@ It is not universal, though. Anyone who follows the Sentry, Bugsnag or
 Crashlytics setup guides sets `SOURCEMAP_FILE` and is already on the other side
 of this. The affected set is iOS builds with no source map upload configured,
 which is the default rather than the exception.
+
+## Debug info also carries the build machine's paths
+
+Size is the obvious cost. It is not the only one. The section records the path
+the bundle was compiled from, and `hbcinfo` prints it:
+
+```
+debug info
+  compiled from     /Users/expo/workingdir/build/ios/build/Build/Intermediates.noindex/...
+  functions covered 8944 of 29357
+  location records  179084
+```
+
+That is a CI worker's filesystem layout, shipped inside the app to every user.
+A locally built one says the same about the developer's machine. Neither is a
+vulnerability on its own, and neither was anybody's decision either.
+
+A bundle built with `-output-source-map` has no such section, so the same flag
+that removes the bytes removes this too.
 
 ## Scope
 
@@ -445,6 +477,12 @@ Three details in the format are easy to read wrong, and each has its own test:
 - **Deduplicated function bodies are counted once.** Hermes shares identical
   bodies between headers, so summing every function's size overcounts, by
   80 KB on the bundle above.
+- **The two treemap images are screenshots.** Everything else here is checked
+  against the data it came from, but those two PNGs are not: they were taken by
+  hand from `--html` output on a real bundle, which cannot be committed. If the
+  rendering changes they go stale and nothing fails. The page itself is covered
+  by tests, so what is unguarded is the picture in this file, not the feature.
+
 - **The container path has no unit tests.** Its pure helpers do; the zip reading
   itself is covered by an end-to-end check that reading from a container gives
   output identical to unzipping first. Building zip fixtures in-process was not

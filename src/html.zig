@@ -393,3 +393,79 @@ const script =
     \\</html>
     \\
 ;
+
+const testing = std.testing;
+
+/// Renders into a caller-owned buffer so a test can assert on the whole
+/// document. The page is mostly fixed boilerplate, so a generous slab costs
+/// nothing and keeps the helper free of allocator plumbing.
+fn renderInto(buf: []u8, label: []const u8, root: tree.Node) ![]const u8 {
+    var out = Io.Writer.fixed(buf);
+    try write(&out, label, 96, root);
+    return out.buffered();
+}
+
+test "the page pulls nothing from the network" {
+    const root = tree.Node{ .name = "bundle", .key = "bundle", .bytes = 10 };
+    const buf = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(buf);
+    const html = try renderInto(buf, "a.hbc", root);
+
+    // A page that fetches anything is a page that can behave differently on
+    // someone else's machine, or stop working when a CDN does.
+    try testing.expect(std.mem.indexOf(u8, html, "http://") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "https://") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "src=") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "@import") == null);
+}
+
+test "a module path cannot end the script element" {
+    // Paths come out of a source map, so they are attacker-adjacent input at
+    // worst and awkward input at best. A name carrying `</script>` must not
+    // close the block the data sits in.
+    const child = tree.Node{
+        .name = "</script><img onerror=alert(1)>",
+        .key = "x",
+        .bytes = 4,
+    };
+    var kids = [_]tree.Node{child};
+    const root = tree.Node{ .name = "bundle", .key = "bundle", .bytes = 4, .children = &kids };
+
+    const buf = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(buf);
+    const html = try renderInto(buf, "a.hbc", root);
+
+    try testing.expect(std.mem.indexOf(u8, html, "</script><img") == null);
+    // The name still has to survive, just neutered.
+    try testing.expect(std.mem.indexOf(u8, html, "script") != null);
+}
+
+test "a label with html in it lands escaped in the heading" {
+    const root = tree.Node{ .name = "bundle", .key = "bundle", .bytes = 1 };
+    const buf = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(buf);
+    const html = try renderInto(buf, "a<&\">.hbc", root);
+
+    try testing.expect(std.mem.indexOf(u8, html, "&lt;") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "&amp;") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<h1 title=\"a<") == null);
+}
+
+test "every node's bytes reach the page" {
+    var kids = [_]tree.Node{
+        .{ .name = "one", .key = "one", .bytes = 700 },
+        .{ .name = "two", .key = "two", .bytes = 300 },
+    };
+    const root = tree.Node{ .name = "bundle", .key = "bundle", .bytes = 1000, .children = &kids };
+
+    const buf = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(buf);
+    const html = try renderInto(buf, "a.hbc", root);
+
+    // Tile area is computed in the page from these numbers, so if they are
+    // right the picture is proportional; if they are wrong no amount of
+    // looking at a screenshot would say so.
+    try testing.expect(std.mem.indexOf(u8, html, "\"b\":700") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"b\":300") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "1000 bytes") != null);
+}

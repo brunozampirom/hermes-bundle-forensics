@@ -3,6 +3,10 @@ const std = @import("std");
 /// Every file with tests needs its own test artifact: `zig test` only runs
 /// tests in the root it is given, so pointing it at main.zig alone would
 /// silently skip the parser tests, which are the ones that matter.
+///
+/// Being a hand-kept list, it can fall behind a new file, and it already did
+/// once: html.zig was absent, so its tests would have been written and never
+/// run. CI now fails when a file with tests is missing from here.
 const test_roots = [_][]const u8{
     "src/hbc.zig",
     "src/strings.zig",
@@ -12,6 +16,7 @@ const test_roots = [_][]const u8{
     "src/debug.zig",
     "src/sourcemap.zig",
     "src/modules.zig",
+    "src/html.zig",
     "src/main.zig",
 };
 

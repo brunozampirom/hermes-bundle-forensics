@@ -45,3 +45,17 @@ jobs:
             fi
           done
           test "$missing" -eq 0
+
+      # test_roots in build.zig is a hand-kept list, and zig only runs tests in
+      # the root it is handed. html.zig was missing from it, so four tests were
+      # written, committed, and never executed, and nothing said so. Any file
+      # carrying a test has to be listed.
+      - name: Assert every file with tests is a test root
+        run: |
+          set -eu
+          missing=0
+          for f in src/*.zig; do
+            grep -q '^test "' "$f" || continue
+            grep -q "\"$f\"" build.zig || { echo "$f has tests but is not in test_roots"; missing=1; }
+          done
+          test "$missing" -eq 0
