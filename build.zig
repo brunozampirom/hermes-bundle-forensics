@@ -8,6 +8,7 @@ const test_roots = [_][]const u8{
     "src/strings.zig",
     "src/container.zig",
     "src/tree.zig",
+    "src/budget.zig",
     "src/main.zig",
 };
 

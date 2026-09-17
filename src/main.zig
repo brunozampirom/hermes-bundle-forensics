@@ -7,6 +7,7 @@ const strings = @import("strings.zig");
 const container = @import("container.zig");
 const tree = @import("tree.zig");
 const html = @import("html.zig");
+const budget = @import("budget.zig");
 
 const usage =
     \\hbcinfo: Hermes bundle forensics
@@ -17,10 +18,15 @@ const usage =
     \\<file> is either a raw Hermes bundle, or an .apk / .aab / .ipa to
     \\pull one out of. Containers are detected by signature, not extension.
     \\
+    \\Give a second file to diff the two.
+    \\
     \\options:
     \\  --top N        list the N largest functions and strings (default 10,
     \\                 0 to skip both listings)
     \\  --entry PATH   which bundle to read, when a container holds several
+    \\  --entry-b PATH same, for the second file in a diff
+    \\  --html PATH    write a treemap of the bundle to PATH as one html file
+    \\  --budget PATH  check section sizes against a budget file; over exits 1
     \\  --list         list the bundles in a container and exit
     \\
 ;
@@ -38,6 +44,8 @@ const Args = struct {
     entry_b: ?[]const u8 = null,
     /// Where to write the treemap, when asked for one.
     html: ?[]const u8 = null,
+    /// Budget file to check the bundle against; a breach exits non-zero.
+    budget: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -69,7 +77,71 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
+
+    if (args.budget) |path| {
+        const code = try runBudget(arena, io, out, a, path);
+        try out.flush();
+        if (code != 0) std.process.exit(code);
+        return;
+    }
     try out.flush();
+}
+
+/// Checks a bundle against a budget file and returns the process exit code.
+/// An unknown section name fails too: a budget quietly checking nothing is the
+/// failure mode worth designing against.
+fn runBudget(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    b: Bundle,
+    path: []const u8,
+) !u8 {
+    const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| {
+        try out.print("error: could not read budget {s}: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+
+    const parsed = try budget.parse(arena, text);
+    const limits = switch (parsed) {
+        .bad => |bad| {
+            try out.print("error: {s}:{d}: {s}\n", .{ path, bad.line, switch (bad.err) {
+                error.MissingEquals => "expected 'section = bytes'",
+                error.BadNumber => "the limit is not a number",
+                error.EmptyName => "the section name is empty",
+            } });
+            return 1;
+        },
+        .ok => |l| l,
+    };
+
+    const scratch = try arena.dupe(hbc.Function, b.functions);
+    const stats = hbc.bytecodeStats(scratch);
+    var buf: [hbc.SECTION_COUNT]hbc.Section = undefined;
+    const secs = hbc.sections(b.header, stats.distinct_bytes, stats.overflowed_headers, &buf);
+
+    const report_ = try budget.check(arena, limits, secs, b.bytes.len);
+
+    try out.print("\nbudget {s}\n", .{path});
+    for (report_.rows) |r| {
+        if (r.unknown) {
+            try out.print("  {s:<24} {s:>12}   no section by that name\n", .{ r.name, "-" });
+            continue;
+        }
+        try out.print("  {s:<24} {d:>12} / {d:<12} {s}\n", .{
+            r.name,
+            r.actual,
+            r.max_bytes,
+            if (r.over()) "OVER" else "ok",
+        });
+    }
+
+    if (report_.failed > 0 or report_.unknown > 0) {
+        try out.print("\n{d} over budget, {d} unknown\n", .{ report_.failed, report_.unknown });
+        return 1;
+    }
+    try out.print("\nall {d} within budget\n", .{report_.rows.len});
+    return 0;
 }
 
 /// Writes the treemap and says where it went. Printing the path rather than
@@ -272,6 +344,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
     var list = false;
     var path_b: ?[]const u8 = null;
     var html_out: ?[]const u8 = null;
+    var budget_file: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -288,6 +361,10 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
             i += 1;
             if (i >= argv.len) return null;
             entry_b = argv[i];
+        } else if (std.mem.eql(u8, a, "--budget")) {
+            i += 1;
+            if (i >= argv.len) return null;
+            budget_file = argv[i];
         } else if (std.mem.eql(u8, a, "--html")) {
             i += 1;
             if (i >= argv.len) return null;
@@ -310,6 +387,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
         .top = top,
         .entry = entry,
         .html = html_out,
+        .budget = budget_file,
         .list = list,
         .path_b = path_b,
         .entry_b = entry_b,
