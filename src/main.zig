@@ -159,7 +159,14 @@ fn reportModules(
 /// different parts of the compiler, so a reader that drifted would break the
 /// match rather than quietly print plausible line numbers.
 fn reportDebugInfo(out: *Io.Writer, gpa: std.mem.Allocator, b: Bundle) !void {
-    const info = debug.init(b.bytes, b.header) catch return;
+    // NoDebugInfo is the normal case for a release bundle and says nothing
+    // worth printing. Any other failure means the section is there and this
+    // could not read it, which stayed silent before and hid a whole megabyte.
+    const info = debug.init(b.bytes, b.header) catch |err| {
+        if (err == error.NoDebugInfo) return;
+        try out.print("\ndebug info\n  unreadable: {s}\n", .{@errorName(err)});
+        return;
+    };
 
     const walked = debug.walk(gpa, info) catch |err| {
         try out.print("\ndebug info\n  unreadable: {s}\n", .{@errorName(err)});
@@ -195,14 +202,19 @@ fn reportDebugInfo(out: *Io.Writer, gpa: std.mem.Allocator, b: Bundle) !void {
         try out.print("  source lines      {d} to {d}\n", .{ min_line, max_line });
     }
 
-    if (flagged != walked.locations.len) {
+    // Cross-checking the record count against the headers only works on the
+    // classic line. `static_h` still has the HasDebugInfo bit, but measured
+    // against bytecode 98 it is zero on all 116846 headers of a bundle
+    // carrying 5.6 MB of debug info, so a mismatch there says nothing about
+    // the decode. Claiming otherwise would be a warning that always fires.
+    if (hbc.Format.forVersion(b.header.version) == .classic and flagged != walked.locations.len) {
         try out.print("  MISMATCH          {d} headers flag debug info, {d} records found\n", .{
             flagged, walked.locations.len,
         });
     }
-    if (walked.ended_at != info.header.scope_desc_data_offset) {
+    if (walked.ended_at != info.header.locations_end) {
         try out.print("  DESYNC            walk ended at {d}, expected {d}\n", .{
-            walked.ended_at, info.header.scope_desc_data_offset,
+            walked.ended_at, info.header.locations_end,
         });
     }
 }

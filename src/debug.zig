@@ -12,7 +12,18 @@
 const std = @import("std");
 const hbc = @import("hbc.zig");
 
-pub const HEADER_SIZE: usize = 28;
+/// The two lines disagree on this header. `classic` carries seven words;
+/// `static_h` dropped the lexical scope data, the textified callees and the
+/// debugger string table, and the three fields that located them, leaving four.
+/// Reading 28 bytes off a `static_h` bundle takes the filename table as header
+/// fields and every offset after it lands in the wrong place.
+pub fn headerSize(format: hbc.Format) usize {
+    return switch (format) {
+        .classic => 28,
+        .static_h => 16,
+    };
+}
+
 pub const FILENAME_ENTRY_SIZE: usize = 8;
 pub const FILE_REGION_SIZE: usize = 12;
 
@@ -20,11 +31,15 @@ pub const Header = struct {
     filename_count: u32,
     filename_storage_size: u32,
     file_region_count: u32,
-    /// Source location records occupy the data from 0 up to here.
-    scope_desc_data_offset: u32,
-    textified_callee_offset: u32,
-    string_table_offset: u32,
     debug_data_size: u32,
+    /// Source location records occupy the data from 0 up to here. `classic`
+    /// stores it as `scopeDescDataOffset`, since the scope data follows the
+    /// records inside the same blob. `static_h` has no scope data, so the
+    /// records run to the end and this is the whole size.
+    locations_end: u32,
+    /// `classic` only. Both are zero on `static_h`, which does not carry them.
+    textified_callee_offset: u32 = 0,
+    string_table_offset: u32 = 0,
 };
 
 pub const FileRegion = struct {
@@ -90,7 +105,8 @@ pub const Info = struct {
 pub fn init(file: []const u8, h: hbc.Header) Error!Info {
     if (h.debug_info_offset == 0) return error.NoDebugInfo;
     const at: usize = h.debug_info_offset;
-    if (at + HEADER_SIZE > file.len) return error.Truncated;
+    const format = hbc.Format.forVersion(h.version);
+    if (at + headerSize(format) > file.len) return error.Truncated;
 
     var p = at;
     const rd = struct {
@@ -101,18 +117,28 @@ pub fn init(file: []const u8, h: hbc.Header) Error!Info {
         }
     }.f;
 
-    const header = Header{
+    var header = Header{
         .filename_count = rd(file, &p),
         .filename_storage_size = rd(file, &p),
         .file_region_count = rd(file, &p),
-        .scope_desc_data_offset = rd(file, &p),
-        .textified_callee_offset = rd(file, &p),
-        .string_table_offset = rd(file, &p),
-        .debug_data_size = rd(file, &p),
+        .debug_data_size = 0,
+        .locations_end = 0,
     };
+    switch (format) {
+        .classic => {
+            header.locations_end = rd(file, &p);
+            header.textified_callee_offset = rd(file, &p);
+            header.string_table_offset = rd(file, &p);
+            header.debug_data_size = rd(file, &p);
+        },
+        .static_h => {
+            header.debug_data_size = rd(file, &p);
+            header.locations_end = header.debug_data_size;
+        },
+    }
 
     // A stripped build writes this header with every field zero and nothing
-    // after it, which is the 28 byte section a release bundle should have.
+    // after it: 28 bytes on the classic line, 16 on static_h.
     if (header.debug_data_size == 0 and header.filename_count == 0) {
         return error.NoDebugInfo;
     }
@@ -169,14 +195,14 @@ pub const Location = struct {
 
 pub const WalkResult = struct {
     locations: []Location,
-    /// Where the walk stopped. Equal to scope_desc_data_offset when every
+    /// Where the walk stopped. Equal to locations_end when every
     /// record was decoded cleanly, which is the check worth making.
     ended_at: u32,
 };
 
 /// Decodes every source location record. Caller owns the returned slice.
 pub fn walk(gpa: std.mem.Allocator, info: Info) !WalkResult {
-    const end = info.header.scope_desc_data_offset;
+    const end = info.header.locations_end;
     const data = info.file[info.data_at..][0..info.header.debug_data_size];
 
     var out: std.ArrayList(Location) = .empty;
@@ -272,7 +298,11 @@ test "a stripped section reads as having no debug info" {
 
 /// Builds a debug section with `records` source location records, so the walk
 /// can be tested without a 5 MB bundle on disk.
-fn synthSection(gpa: std.mem.Allocator, records: []const [3]i64) !struct { bytes: []u8, header: hbc.Header } {
+fn synthSection(
+    gpa: std.mem.Allocator,
+    format: hbc.Format,
+    records: []const [3]i64,
+) !struct { bytes: []u8, header: hbc.Header } {
     var data: std.ArrayList(u8) = .empty;
     errdefer data.deinit(gpa);
 
@@ -292,7 +322,7 @@ fn synthSection(gpa: std.mem.Allocator, records: []const [3]i64) !struct { bytes
 
     const name = "bundle.js";
     const debug_at = 256;
-    const size = debug_at + HEADER_SIZE + FILENAME_ENTRY_SIZE + name.len +
+    const size = debug_at + headerSize(format) + FILENAME_ENTRY_SIZE + name.len +
         FILE_REGION_SIZE + data.items.len;
     const bytes = try gpa.alloc(u8, size);
     @memset(bytes, 0);
@@ -307,9 +337,11 @@ fn synthSection(gpa: std.mem.Allocator, records: []const [3]i64) !struct { bytes
     wr(bytes, &p, 1); // filenameCount
     wr(bytes, &p, @intCast(name.len)); // filenameStorageSize
     wr(bytes, &p, 1); // fileRegionCount
-    wr(bytes, &p, @intCast(data.items.len)); // scopeDescDataOffset
-    wr(bytes, &p, @intCast(data.items.len)); // textifiedCalleeOffset
-    wr(bytes, &p, @intCast(data.items.len)); // stringTableOffset
+    if (format == .classic) {
+        wr(bytes, &p, @intCast(data.items.len)); // scopeDescDataOffset
+        wr(bytes, &p, @intCast(data.items.len)); // textifiedCalleeOffset
+        wr(bytes, &p, @intCast(data.items.len)); // stringTableOffset
+    }
     wr(bytes, &p, @intCast(data.items.len)); // debugDataSize
 
     wr(bytes, &p, 0); // filename offset
@@ -325,6 +357,10 @@ fn synthSection(gpa: std.mem.Allocator, records: []const [3]i64) !struct { bytes
     data.deinit(gpa);
 
     var h = std.mem.zeroes(hbc.Header);
+    h.version = switch (format) {
+        .classic => hbc.CLASSIC_VERSION_MAX,
+        .static_h => hbc.CLASSIC_VERSION_MAX + 1,
+    };
     h.debug_info_offset = debug_at;
     return .{ .bytes = bytes, .header = h };
 }
@@ -332,38 +368,55 @@ fn synthSection(gpa: std.mem.Allocator, records: []const [3]i64) !struct { bytes
 test "walks every record and lands on the boundary" {
     const gpa = testing.allocator;
     const records = [_][3]i64{ .{ 0, 1, 0 }, .{ 1, 42, 7 }, .{ 2, 1000, 3 } };
-    const s = try synthSection(gpa, &records);
+
+    // Both lines, because the header they sit behind is not the same size and
+    // reading the wrong one still produces a plausible looking walk.
+    for ([_]hbc.Format{ .classic, .static_h }) |format| {
+        const s = try synthSection(gpa, format, &records);
+        defer gpa.free(s.bytes);
+
+        const info = try init(s.bytes, s.header);
+        try testing.expectEqualStrings("bundle.js", info.filename(0).?);
+        try testing.expectEqualStrings("bundle.js", info.filenameForOffset(0).?);
+
+        const w = try walk(gpa, info);
+        defer gpa.free(w.locations);
+
+        try testing.expectEqual(records.len, w.locations.len);
+        // Landing anywhere else means the records were decoded wrong.
+        try testing.expectEqual(info.header.locations_end, w.ended_at);
+
+        for (records, w.locations) |want, got| {
+            try testing.expectEqual(@as(u32, @intCast(want[0])), got.function_index);
+            try testing.expectEqual(want[1], got.line);
+            try testing.expectEqual(want[2], got.column);
+            try testing.expectEqual(@as(u32, 1), got.entries);
+        }
+    }
+}
+
+test "the static_h header is four words, not seven" {
+    const gpa = testing.allocator;
+    const records = [_][3]i64{.{ 0, 1, 0 }};
+    const s = try synthSection(gpa, .static_h, &records);
     defer gpa.free(s.bytes);
 
     const info = try init(s.bytes, s.header);
-    try testing.expectEqualStrings("bundle.js", info.filename(0).?);
-    try testing.expectEqualStrings("bundle.js", info.filenameForOffset(0).?);
-
-    const w = try walk(gpa, info);
-    defer gpa.free(w.locations);
-
-    try testing.expectEqual(records.len, w.locations.len);
-    // Landing anywhere else means the records were decoded wrong.
-    try testing.expectEqual(info.header.scope_desc_data_offset, w.ended_at);
-
-    for (records, w.locations) |want, got| {
-        try testing.expectEqual(@as(u32, @intCast(want[0])), got.function_index);
-        try testing.expectEqual(want[1], got.line);
-        try testing.expectEqual(want[2], got.column);
-        try testing.expectEqual(@as(u32, 1), got.entries);
-    }
+    // Reading 28 bytes here would swallow the filename table and the region,
+    // which is what shipped before: a 5.6 MB section decoded as nothing.
+    try testing.expectEqual(@as(usize, 256 + 16), info.table_at);
+    try testing.expectEqual(info.header.debug_data_size, info.header.locations_end);
+    try testing.expectEqual(@as(u32, 0), info.header.textified_callee_offset);
 }
 
 test "a record running past the boundary is an error" {
     const gpa = testing.allocator;
-    const s = try synthSection(gpa, &[_][3]i64{.{ 0, 1, 0 }});
+    const s = try synthSection(gpa, .classic, &[_][3]i64{.{ 0, 1, 0 }});
     defer gpa.free(s.bytes);
 
-    var h = s.header;
-    const info = try init(s.bytes, h);
+    const info = try init(s.bytes, s.header);
     // Cut the boundary short so the terminator falls outside it.
-    h = s.header;
     var cut = info;
-    cut.header.scope_desc_data_offset -= 1;
+    cut.header.locations_end -= 1;
     try testing.expectError(error.BadRecord, walk(gpa, cut));
 }
