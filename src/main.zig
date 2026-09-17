@@ -904,15 +904,23 @@ fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
 
 fn reportTopFunctions(
     out: *Io.Writer,
-    functions: []hbc.Function,
+    functions: []const hbc.Function,
     table: ?strings.Table,
     top: u32,
 ) !void {
-    std.sort.pdq(hbc.Function, functions, {}, hbc.moreByBytecodeSize);
-    const n = @min(@as(usize, top), functions.len);
+    // On its own copy. Sorting the caller's slice left the bundle's functions
+    // in size order for everything that ran afterwards, and module attribution
+    // walks them in index order to rebuild each one's virtual offset. It read
+    // whatever this had left behind and attributed the bytes to the wrong
+    // modules, which is a wrong answer rather than a missing one.
+    const gpa = std.heap.page_allocator;
+    const sorted = try gpa.dupe(hbc.Function, functions);
+    defer gpa.free(sorted);
+    std.sort.pdq(hbc.Function, sorted, {}, hbc.moreByBytecodeSize);
+    const n = @min(@as(usize, top), sorted.len);
 
     try out.print("\ntop {d} functions by bytecode size\n", .{n});
-    for (functions[0..n]) |f| {
+    for (sorted[0..n]) |f| {
         try out.print("  {d:>8} bytes  #{d:<7} params {d:<3} frame {d:<4} ", .{
             f.bytecode_size, f.index, f.param_count, f.frame_size,
         });
@@ -974,6 +982,32 @@ fn printSection(out: *Io.Writer, name: []const u8, bytes: u64, total: u64) !void
     try out.print("  {s:<30} {d:>12}  {d:>3}.{d}%\n", .{
         name, bytes, tenths / 10, tenths % 10,
     });
+}
+
+test "listing the top functions leaves the caller's order alone" {
+    const gpa = std.testing.allocator;
+
+    // Index order, sizes deliberately not in it. Module attribution rebuilds
+    // each function's virtual offset by summing sizes in this order, so a
+    // report that reorders them in place silently moves the bytes.
+    var functions = [_]hbc.Function{
+        .{ .index = 0, .offset = 0, .param_count = 0, .bytecode_size = 10, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = @bitCast(@as(u8, 0)), .from_large_header = false },
+        .{ .index = 1, .offset = 10, .param_count = 0, .bytecode_size = 900, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = @bitCast(@as(u8, 0)), .from_large_header = false },
+        .{ .index = 2, .offset = 910, .param_count = 0, .bytecode_size = 50, .name_id = 0, .info_offset = 0, .frame_size = 0, .environment_size = 0, .flags = @bitCast(@as(u8, 0)), .from_large_header = false },
+    };
+    const before = functions;
+
+    var w = std.Io.Writer.Allocating.init(gpa);
+    defer w.deinit();
+    try reportTopFunctions(&w.writer, &functions, null, 3);
+
+    for (before, functions) |want, got| {
+        try std.testing.expectEqual(want.index, got.index);
+        try std.testing.expectEqual(want.bytecode_size, got.bytecode_size);
+    }
+    // The listing itself still has to come out largest first.
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "900").? <
+        std.mem.indexOf(u8, w.written(), "50").?);
 }
 
 test "looksLikeText spots a plain-JS dev bundle" {
