@@ -8,6 +8,7 @@ const container = @import("container.zig");
 const tree = @import("tree.zig");
 const html = @import("html.zig");
 const budget = @import("budget.zig");
+const debug = @import("debug.zig");
 
 const usage =
     \\hbcinfo: Hermes bundle forensics
@@ -93,6 +94,62 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     try out.flush();
+}
+
+/// What the debug info section holds, for the bundles that carry one.
+///
+/// Two checks guard the decode. The walk has to finish exactly on the scope
+/// descriptor boundary, and the number of records has to match the number of
+/// function headers whose flags claim to have one. Those are written by
+/// different parts of the compiler, so a reader that drifted would break the
+/// match rather than quietly print plausible line numbers.
+fn reportDebugInfo(out: *Io.Writer, gpa: std.mem.Allocator, b: Bundle) !void {
+    const info = debug.init(b.bytes, b.header) catch return;
+
+    const walked = debug.walk(gpa, info) catch |err| {
+        try out.print("\ndebug info\n  unreadable: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer gpa.free(walked.locations);
+
+    try out.print("\ndebug info\n", .{});
+    if (info.filename(0)) |name| {
+        try out.print("  compiled from     {s}\n", .{name});
+    }
+    if (info.header.file_region_count != 1) {
+        try out.print("  file regions      {d}\n", .{info.header.file_region_count});
+    }
+
+    var entries: u64 = 0;
+    var min_line: i64 = std.math.maxInt(i64);
+    var max_line: i64 = std.math.minInt(i64);
+    for (walked.locations) |l| {
+        entries += l.entries;
+        min_line = @min(min_line, l.line);
+        max_line = @max(max_line, l.line);
+    }
+
+    var flagged: u32 = 0;
+    for (b.functions) |f| {
+        if (f.flags.has_debug_info) flagged += 1;
+    }
+
+    try out.print("  functions covered {d} of {d}\n", .{ walked.locations.len, b.header.function_count });
+    try out.print("  location records  {d}\n", .{entries});
+    if (walked.locations.len > 0) {
+        try out.print("  source lines      {d} to {d}\n", .{ min_line, max_line });
+    }
+
+    if (flagged != walked.locations.len) {
+        try out.print("  MISMATCH          {d} headers flag debug info, {d} records found\n", .{
+            flagged, walked.locations.len,
+        });
+    }
+    if (walked.ended_at != info.header.scope_desc_data_offset) {
+        try out.print("  DESYNC            walk ended at {d}, expected {d}\n", .{
+            walked.ended_at, info.header.scope_desc_data_offset,
+        });
+    }
 }
 
 /// The two bytecode lines name different sections in the same slots, so any
@@ -735,6 +792,8 @@ fn report(out: *Io.Writer, b: Bundle, top: u32) !void {
     } else {
         try out.print("\nstrings            section offsets do not fit the file; skipped\n", .{});
     }
+
+    try reportDebugInfo(out, std.heap.page_allocator, b);
 
     try out.print("\nsection map\n", .{});
     var buf: [hbc.SECTION_COUNT]hbc.Section = undefined;
