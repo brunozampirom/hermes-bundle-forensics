@@ -5,6 +5,8 @@ const Io = std.Io;
 const hbc = @import("hbc.zig");
 const strings = @import("strings.zig");
 const container = @import("container.zig");
+const tree = @import("tree.zig");
+const html = @import("html.zig");
 
 const usage =
     \\hbcinfo: Hermes bundle forensics
@@ -34,6 +36,8 @@ const Args = struct {
     /// When set, the run is a diff of path -> path_b.
     path_b: ?[]const u8 = null,
     entry_b: ?[]const u8 = null,
+    /// Where to write the treemap, when asked for one.
+    html: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -63,7 +67,31 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try report(out, a, args.top);
     }
+
+    if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
     try out.flush();
+}
+
+/// Writes the treemap and says where it went. Printing the path rather than
+/// opening a browser keeps this to one static binary with no per-platform code.
+fn writeTreemap(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    b: Bundle,
+    dest: []const u8,
+) !void {
+    const root = try tree.build(arena, b.header, b.functions, b.table, b.bytes.len, .{});
+
+    const file = try Io.Dir.cwd().createFile(io, dest, .{});
+    defer file.close(io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try html.write(&writer.interface, b.label, b.header.version, root);
+    try writer.interface.flush();
+
+    try out.print("\ntreemap written to {s}\n", .{dest});
 }
 
 const Loaded = struct {
@@ -243,6 +271,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
     var entry_b: ?[]const u8 = null;
     var list = false;
     var path_b: ?[]const u8 = null;
+    var html_out: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -259,6 +288,10 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
             i += 1;
             if (i >= argv.len) return null;
             entry_b = argv[i];
+        } else if (std.mem.eql(u8, a, "--html")) {
+            i += 1;
+            if (i >= argv.len) return null;
+            html_out = argv[i];
         } else if (std.mem.eql(u8, a, "--list")) {
             list = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
@@ -276,6 +309,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
         .path = path orelse return null,
         .top = top,
         .entry = entry,
+        .html = html_out,
         .list = list,
         .path_b = path_b,
         .entry_b = entry_b,
