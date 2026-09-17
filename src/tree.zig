@@ -1,5 +1,9 @@
 //! A hierarchical view of where a bundle's bytes went.
 //!
+//! Everything here allocates from the caller allocator and never frees: names
+//! are built per node and some are borrowed from the bundle. Callers pass an
+//! arena, which is what the tool does, and the tests do the same.
+//!
 //! Deliberately generic: a node is a name, a size and children, with no fixed
 //! depth. The text report stays as it is and this is a second consumer of the
 //! same parsed data, so attributing functions to source modules later adds a
@@ -10,7 +14,11 @@ const hbc = @import("hbc.zig");
 const strings = @import("strings.zig");
 
 pub const Node = struct {
+    /// What the tile says.
     name: []const u8,
+    /// What two builds are matched on. Function display names carry an index
+    /// that shifts between builds, so the key is the bare name.
+    key: []const u8,
     bytes: u64,
     children: []Node = &.{},
 
@@ -41,10 +49,8 @@ fn cap(gpa: std.mem.Allocator, nodes: []Node, limit: usize, noun: []const u8) ![
 
     const out = try gpa.alloc(Node, limit + 1);
     @memcpy(out[0..limit], nodes[0..limit]);
-    out[limit] = .{
-        .name = try std.fmt.allocPrint(gpa, "other ({d} {s})", .{ nodes.len - limit, noun }),
-        .bytes = rest,
-    };
+    const tail = try std.fmt.allocPrint(gpa, "other ({d} {s})", .{ nodes.len - limit, noun });
+    out[limit] = .{ .name = tail, .key = tail, .bytes = rest };
     return out;
 }
 
@@ -76,8 +82,10 @@ fn functionNodes(
         i += shared;
         if (f.bytecode_size == 0) continue;
 
+        const named = try functionName(gpa, f, table, shared);
         try nodes.append(gpa, .{
-            .name = try functionName(gpa, f, table, shared),
+            .name = named.display,
+            .key = named.key,
             .bytes = f.bytecode_size,
         });
     }
@@ -89,33 +97,38 @@ fn lessByOffset(_: void, a: hbc.Function, b: hbc.Function) bool {
     return a.offset < b.offset;
 }
 
+const Named = struct { display: []const u8, key: []const u8 };
+
 fn functionName(
     gpa: std.mem.Allocator,
     f: hbc.Function,
     table: ?strings.Table,
     shared: usize,
-) ![]const u8 {
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    errdefer aw.deinit();
-    const w = &aw.writer;
+) !Named {
+    var kw = std.Io.Writer.Allocating.init(gpa);
+    errdefer kw.deinit();
 
     if (table) |t| {
         if (t.get(f.name_id)) |name| {
             if (name.bytes.len == 0) {
-                try w.print("(anonymous) #{d}", .{f.index});
+                try kw.writer.print("(anonymous)", .{});
             } else {
-                try strings.writeEscaped(w, name, 80);
-                try w.print(" #{d}", .{f.index});
+                try strings.writeEscaped(&kw.writer, name, 80);
             }
         } else |_| {
-            try w.print("#{d} (name {d} unreadable)", .{ f.index, f.name_id });
+            try kw.writer.print("(name {d} unreadable)", .{f.name_id});
         }
     } else {
-        try w.print("#{d} name {d}", .{ f.index, f.name_id });
+        try kw.writer.print("name {d}", .{f.name_id});
     }
+    const key = try kw.toOwnedSlice();
 
-    if (shared > 1) try w.print(" [body shared by {d}]", .{shared});
-    return aw.toOwnedSlice();
+    var dw = std.Io.Writer.Allocating.init(gpa);
+    errdefer dw.deinit();
+    try dw.writer.print("{s} #{d}", .{ key, f.index });
+    if (shared > 1) try dw.writer.print(" [body shared by {d}]", .{shared});
+
+    return .{ .display = try dw.toOwnedSlice(), .key = key };
 }
 
 const Claim = struct { id: u32, offset: u32, len: u32, unique: u32 };
@@ -184,22 +197,24 @@ fn stringNodes(
         if (c.unique == 0) continue;
         const s = table.get(c.id) catch continue;
 
-        var aw = std.Io.Writer.Allocating.init(gpa);
-        errdefer aw.deinit();
-        try strings.writeEscaped(&aw.writer, s, 80);
-        try aw.writer.print(" #{d}", .{c.id});
+        var kw = std.Io.Writer.Allocating.init(gpa);
+        errdefer kw.deinit();
+        try strings.writeEscaped(&kw.writer, s, 80);
+        const key = try kw.toOwnedSlice();
+
+        var dw = std.Io.Writer.Allocating.init(gpa);
+        errdefer dw.deinit();
+        try dw.writer.print("{s} #{d}", .{ key, c.id });
         if (c.unique < c.len) {
-            try aw.writer.print(" [{d} of {d} bytes shared]", .{ c.len - c.unique, c.len });
+            try dw.writer.print(" [{d} of {d} bytes shared]", .{ c.len - c.unique, c.len });
         }
 
-        try nodes.append(gpa, .{ .name = try aw.toOwnedSlice(), .bytes = c.unique });
+        try nodes.append(gpa, .{ .name = try dw.toOwnedSlice(), .key = key, .bytes = c.unique });
     }
 
     if (covered < storage_size) {
-        try nodes.append(gpa, .{
-            .name = try std.fmt.allocPrint(gpa, "unreferenced ({d} bytes)", .{storage_size - covered}),
-            .bytes = storage_size - covered,
-        });
+        const text = try std.fmt.allocPrint(gpa, "unreferenced ({d} bytes)", .{storage_size - covered});
+        try nodes.append(gpa, .{ .name = text, .key = "unreferenced", .bytes = storage_size - covered });
     }
 
     return cap(gpa, try nodes.toOwnedSlice(gpa), opts.max_children, "strings");
@@ -231,7 +246,7 @@ pub fn build(
         known += s.bytes;
         if (s.bytes == 0) continue;
 
-        var node = Node{ .name = s.name, .bytes = s.bytes };
+        var node = Node{ .name = s.name, .key = s.name, .bytes = s.bytes };
         if (std.mem.eql(u8, s.name, "function bytecode")) {
             node.children = try functionNodes(gpa, functions, table, opts);
         } else if (std.mem.eql(u8, s.name, "string storage")) {
@@ -242,13 +257,13 @@ pub fn build(
 
     const rest = if (file_size > known) file_size - known else 0;
     if (rest > 0) {
-        try kids.append(gpa, .{ .name = "rest (info + padding)", .bytes = rest });
+        try kids.append(gpa, .{ .name = "rest (info + padding)", .key = "rest", .bytes = rest });
     }
 
     const children = try kids.toOwnedSlice(gpa);
     std.sort.pdq(Node, children, {}, moreBySize);
 
-    return .{ .name = "bundle", .bytes = file_size, .children = children };
+    return .{ .name = "bundle", .key = "bundle", .bytes = file_size, .children = children };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,20 +273,20 @@ pub fn build(
 const testing = std.testing;
 
 test "capping keeps the folded bytes" {
-    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
     const nodes = try gpa.alloc(Node, 5);
     defer gpa.free(nodes);
-    for (nodes, 0..) |*n, i| n.* = .{ .name = "x", .bytes = (5 - i) * 10 };
+    for (nodes, 0..) |*n, i| n.* = .{ .name = "x", .key = "x", .bytes = (5 - i) * 10 };
 
     const out = try cap(gpa, nodes, 2, "things");
-    defer gpa.free(out);
 
     try testing.expectEqual(@as(usize, 3), out.len);
     try testing.expectEqual(@as(u64, 50), out[0].bytes);
     try testing.expectEqual(@as(u64, 40), out[1].bytes);
     // 30 + 20 + 10 folded into the tail node.
     try testing.expectEqual(@as(u64, 60), out[2].bytes);
-    gpa.free(out[2].name);
 
     var total: u64 = 0;
     for (out) |n| total += n.bytes;
@@ -279,7 +294,9 @@ test "capping keeps the folded bytes" {
 }
 
 test "a string contained in another costs no bytes of its own" {
-    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
     const storage_at = 136;
     var b = [_]u8{0} ** (storage_at + 11);
     std.mem.writeInt(u64, b[0..8], hbc.MAGIC, .little);
@@ -301,10 +318,6 @@ test "a string contained in another costs no bytes of its own" {
 
     const t = try strings.Table.init(&b, h);
     const nodes = try stringNodes(gpa, h, t, .{});
-    defer {
-        for (nodes) |n| gpa.free(n.name);
-        gpa.free(nodes);
-    }
 
     // Only the outer string is left; the suffix claims nothing.
     try testing.expectEqual(@as(usize, 1), nodes.len);
@@ -316,7 +329,9 @@ test "a string contained in another costs no bytes of its own" {
 }
 
 test "sections and their children reconcile with the file size" {
-    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
     var b = [_]u8{0} ** 256;
     std.mem.writeInt(u64, b[0..8], hbc.MAGIC, .little);
     std.mem.writeInt(u32, b[8..12], 96, .little);
@@ -326,9 +341,179 @@ test "sections and their children reconcile with the file size" {
     h.file_length = b.len;
 
     const root = try build(gpa, h, &.{}, null, b.len, .{});
-    defer gpa.free(root.children);
 
     var total: u64 = 0;
     for (root.children) |c| total += c.bytes;
     try testing.expectEqual(root.bytes, total);
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+pub const DiffNode = struct {
+    name: []const u8,
+    a_bytes: u64,
+    b_bytes: u64,
+    /// How many nodes on each side were folded under this key.
+    a_count: u32,
+    b_count: u32,
+    children: []DiffNode = &.{},
+
+    pub fn grew(self: DiffNode) bool {
+        return self.b_bytes > self.a_bytes;
+    }
+
+    pub fn delta(self: DiffNode) i64 {
+        return @as(i64, @intCast(self.b_bytes)) - @as(i64, @intCast(self.a_bytes));
+    }
+};
+
+const Agg = struct {
+    display: []const u8,
+    bytes: u64,
+    count: u32,
+    /// The only node under this key, when there is exactly one. Recursing into
+    /// a key that folded several nodes would be comparing different things.
+    only: ?Node,
+};
+
+fn aggregate(
+    gpa: std.mem.Allocator,
+    children: []const Node,
+    map: *std.StringArrayHashMapUnmanaged(Agg),
+) !void {
+    for (children) |c| {
+        const e = try map.getOrPut(gpa, c.key);
+        if (e.found_existing) {
+            e.value_ptr.bytes += c.bytes;
+            e.value_ptr.count += 1;
+            e.value_ptr.only = null;
+        } else {
+            e.value_ptr.* = .{
+                .display = c.name,
+                .bytes = c.bytes,
+                .count = 1,
+                .only = c,
+            };
+        }
+    }
+}
+
+fn label(gpa: std.mem.Allocator, key: []const u8, a: Agg, b: ?Agg) ![]const u8 {
+    const count = @max(a.count, if (b) |x| x.count else 0);
+    // 118 of the 301 largest functions in a real bundle are called
+    // "(anonymous)". Nothing distinguishes them across builds, so they are
+    // summed under one key and the count says so rather than implying a match.
+    if (count > 1) return std.fmt.allocPrint(gpa, "{s} x{d}", .{ key, count });
+    return a.display;
+}
+
+/// Matches children by key and sums the ones that share a key. Sizes come from
+/// the second bundle, so the tiles still partition it; what is only in the
+/// first has no area and is reported separately.
+pub fn diff(gpa: std.mem.Allocator, a: Node, b: Node) !DiffNode {
+    var am: std.StringArrayHashMapUnmanaged(Agg) = .empty;
+    defer am.deinit(gpa);
+    var bm: std.StringArrayHashMapUnmanaged(Agg) = .empty;
+    defer bm.deinit(gpa);
+
+    try aggregate(gpa, a.children, &am);
+    try aggregate(gpa, b.children, &bm);
+
+    var kids: std.ArrayList(DiffNode) = .empty;
+    defer kids.deinit(gpa);
+
+    var bi = bm.iterator();
+    while (bi.next()) |e| {
+        const key = e.key_ptr.*;
+        const bv = e.value_ptr.*;
+        const av: ?Agg = am.get(key);
+
+        var node = DiffNode{
+            .name = try label(gpa, key, bv, av),
+            .a_bytes = if (av) |x| x.bytes else 0,
+            .b_bytes = bv.bytes,
+            .a_count = if (av) |x| x.count else 0,
+            .b_count = bv.count,
+        };
+
+        if (av) |x| {
+            if (x.only != null and bv.only != null and
+                (x.only.?.children.len > 0 or bv.only.?.children.len > 0))
+            {
+                const sub = try diff(gpa, x.only.?, bv.only.?);
+                node.children = sub.children;
+            }
+        }
+        try kids.append(gpa, node);
+    }
+
+    var ai = am.iterator();
+    while (ai.next()) |e| {
+        if (bm.contains(e.key_ptr.*)) continue;
+        const av = e.value_ptr.*;
+        try kids.append(gpa, .{
+            .name = try label(gpa, e.key_ptr.*, av, null),
+            .a_bytes = av.bytes,
+            .b_bytes = 0,
+            .a_count = av.count,
+            .b_count = 0,
+        });
+    }
+
+    const children = try kids.toOwnedSlice(gpa);
+    std.sort.pdq(DiffNode, children, {}, moreByNewSize);
+
+    return .{
+        .name = b.name,
+        .a_bytes = a.bytes,
+        .b_bytes = b.bytes,
+        .a_count = 1,
+        .b_count = 1,
+        .children = children,
+    };
+}
+
+fn moreByNewSize(_: void, x: DiffNode, y: DiffNode) bool {
+    if (x.b_bytes != y.b_bytes) return x.b_bytes > y.b_bytes;
+    return x.a_bytes > y.a_bytes;
+}
+
+test "diff sums nodes that share a key and counts them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const a = Node{ .name = "root", .key = "root", .bytes = 30, .children = @constCast(&[_]Node{
+        .{ .name = "(anonymous) #1", .key = "(anonymous)", .bytes = 10 },
+        .{ .name = "(anonymous) #2", .key = "(anonymous)", .bytes = 20 },
+    }) };
+    const b = Node{ .name = "root", .key = "root", .bytes = 55, .children = @constCast(&[_]Node{
+        .{ .name = "(anonymous) #7", .key = "(anonymous)", .bytes = 25 },
+        .{ .name = "(anonymous) #9", .key = "(anonymous)", .bytes = 30 },
+    }) };
+
+    const d = try diff(gpa, a, b);
+
+    try testing.expectEqual(@as(usize, 1), d.children.len);
+    try testing.expectEqualStrings("(anonymous) x2", d.children[0].name);
+    try testing.expectEqual(@as(u64, 30), d.children[0].a_bytes);
+    try testing.expectEqual(@as(u64, 55), d.children[0].b_bytes);
+    try testing.expectEqual(@as(i64, 25), d.children[0].delta());
+}
+
+test "a node only in the first bundle has no area but is kept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const a = Node{ .name = "root", .key = "root", .bytes = 10, .children = @constCast(&[_]Node{
+        .{ .name = "gone", .key = "gone", .bytes = 10 },
+    }) };
+    const b = Node{ .name = "root", .key = "root", .bytes = 0, .children = &.{} };
+
+    const d = try diff(gpa, a, b);
+
+    try testing.expectEqual(@as(usize, 1), d.children.len);
+    try testing.expectEqual(@as(u64, 0), d.children[0].b_bytes);
+    try testing.expectEqual(@as(i64, -10), d.children[0].delta());
 }
