@@ -12,6 +12,7 @@
 const std = @import("std");
 const hbc = @import("hbc.zig");
 const strings = @import("strings.zig");
+const modules = @import("modules.zig");
 
 pub const Node = struct {
     /// What the tile says.
@@ -32,6 +33,11 @@ pub const Options = struct {
     /// functions, so everything past this is folded into one node that still
     /// carries its bytes.
     max_children: usize = 300,
+    /// When a source map was given, the bytecode section is broken down by
+    /// module instead of by function. Module paths are stable across builds in
+    /// a way function names are not, which also makes a diff of them mean
+    /// something.
+    attribution: ?modules.Result = null,
 };
 
 fn moreBySize(_: void, a: Node, b: Node) bool {
@@ -129,6 +135,82 @@ fn functionName(
     if (shared > 1) try dw.writer.print(" [body shared by {d}]", .{shared});
 
     return .{ .display = try dw.toOwnedSlice(), .key = key };
+}
+
+/// The package a module path belongs to, and the rest of the path after it.
+/// A real bundle has hundreds of files but far fewer packages, and without the
+/// grouping the tail of small modules becomes the largest tile on the map.
+fn splitPackage(path: []const u8) struct { group: []const u8, rest: []const u8 } {
+    const marker = "/node_modules/";
+    if (std.mem.lastIndexOf(u8, path, marker)) |i| {
+        const after = path[i + marker.len ..];
+        var end = std.mem.indexOfScalar(u8, after, '/') orelse after.len;
+        // A scoped package is two segments, not one.
+        if (after.len > 0 and after[0] == '@') {
+            if (std.mem.indexOfScalarPos(u8, after, end + 1, '/')) |j| end = j;
+        }
+        return .{ .group = after[0..end], .rest = if (end < after.len) after[end + 1 ..] else after };
+    }
+
+    // Anything else groups by its first two segments, which for an app is the
+    // workspace and the package inside it.
+    var start: usize = 0;
+    if (path.len > 0 and path[0] == '/') start = 1;
+    var end = start;
+    var seen: usize = 0;
+    while (end < path.len and seen < 2) : (end += 1) {
+        if (path[end] == '/') seen += 1;
+    }
+    if (seen < 2) return .{ .group = path[start..], .rest = path[start..] };
+    return .{ .group = path[start .. end - 1], .rest = path[end..] };
+}
+
+/// Two levels: a tile per package, each holding a tile per file. The key stays
+/// the full module path, so a diff compares the thing that is stable between
+/// builds.
+fn moduleNodes(gpa: std.mem.Allocator, a: modules.Result, opts: Options) ![]Node {
+    var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(Node)) = .empty;
+    defer groups.deinit(gpa);
+
+    for (a.modules) |m| {
+        if (m.bytes == 0) continue;
+        const parts = splitPackage(m.name);
+        const e = try groups.getOrPut(gpa, parts.group);
+        if (!e.found_existing) e.value_ptr.* = .empty;
+        try e.value_ptr.append(gpa, .{
+            .name = parts.rest,
+            .key = m.name,
+            .bytes = m.bytes,
+        });
+    }
+
+    var nodes = try std.ArrayList(Node).initCapacity(gpa, groups.count() + 1);
+    defer nodes.deinit(gpa);
+
+    var it = groups.iterator();
+    while (it.next()) |e| {
+        var total: u64 = 0;
+        for (e.value_ptr.items) |c| total += c.bytes;
+
+        const kids = try e.value_ptr.toOwnedSlice(gpa);
+        try nodes.append(gpa, .{
+            .name = e.key_ptr.*,
+            .key = e.key_ptr.*,
+            .bytes = total,
+            // A package holding one file gains nothing from a level of nesting.
+            .children = if (kids.len > 1) try cap(gpa, kids, opts.max_children, "files") else &.{},
+        });
+    }
+
+    if (a.unattributed > 0) {
+        try nodes.append(gpa, .{
+            .name = "(no mapping)",
+            .key = "(no mapping)",
+            .bytes = a.unattributed,
+        });
+    }
+
+    return cap(gpa, try nodes.toOwnedSlice(gpa), opts.max_children, "packages");
 }
 
 const Claim = struct { id: u32, offset: u32, len: u32, unique: u32 };
@@ -248,7 +330,10 @@ pub fn build(
 
         var node = Node{ .name = s.name, .key = s.name, .bytes = s.bytes };
         if (std.mem.eql(u8, s.name, "function bytecode")) {
-            node.children = try functionNodes(gpa, functions, table, opts);
+            node.children = if (opts.attribution) |a|
+                try moduleNodes(gpa, a, opts)
+            else
+                try functionNodes(gpa, functions, table, opts);
         } else if (std.mem.eql(u8, s.name, "string storage")) {
             if (table) |t| node.children = try stringNodes(gpa, h, t, opts);
         }
@@ -516,4 +601,24 @@ test "a node only in the first bundle has no area but is kept" {
     try testing.expectEqual(@as(usize, 1), d.children.len);
     try testing.expectEqual(@as(u64, 0), d.children[0].b_bytes);
     try testing.expectEqual(@as(i64, -10), d.children[0].delta());
+}
+
+test "module paths group by package" {
+    const cases = [_]struct { path: []const u8, group: []const u8 }{
+        .{ .path = "/node_modules/i18next/dist/esm/i18next.js", .group = "i18next" },
+        .{ .path = "/node_modules/@react-native/virtualized-lists/Lists/VirtualizedList.js", .group = "@react-native/virtualized-lists" },
+        .{ .path = "/node_modules/react-native/Libraries/Renderer/x.js", .group = "react-native" },
+        .{ .path = "/apps/mobile/app/game.tsx", .group = "apps/mobile" },
+        .{ .path = "/apps/mobile/hooks/use-game-state.ts", .group = "apps/mobile" },
+    };
+    for (cases) |c| {
+        const got = splitPackage(c.path);
+        try testing.expectEqualStrings(c.group, got.group);
+    }
+}
+
+test "a nested node_modules groups by the innermost package" {
+    const got = splitPackage("/node_modules/a/node_modules/b/index.js");
+    try testing.expectEqualStrings("b", got.group);
+    try testing.expectEqualStrings("index.js", got.rest);
 }

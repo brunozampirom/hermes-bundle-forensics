@@ -89,8 +89,11 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         try report(out, a, args.top);
-        if (args.sourcemap) |mp| try reportModules(arena, io, out, a, mp, args.top);
-        if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
+        const attribution = if (args.sourcemap) |mp|
+            try reportModules(arena, io, out, a, mp, args.top)
+        else
+            null;
+        if (args.html) |dest| try writeTreemap(arena, io, out, a, dest, attribution);
     }
 
     if (args.budget) |path| {
@@ -111,10 +114,10 @@ fn reportModules(
     b: Bundle,
     path: []const u8,
     top: u32,
-) !void {
+) !?modules.Result {
     const json = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(512 * 1024 * 1024)) catch |err| {
         try out.print("\nerror: could not read source map {s}: {s}\n", .{ path, @errorName(err) });
-        return;
+        return null;
     };
 
     const map = sourcemap.parse(arena, json) catch |err| {
@@ -127,7 +130,7 @@ fn reportModules(
                 .{},
             );
         }
-        return;
+        return null;
     };
 
     const r = try modules.attribute(arena, b.functions, map);
@@ -139,12 +142,13 @@ fn reportModules(
         try out.print("  unattributed      {d} bytes with no mapping\n", .{r.unattributed});
     }
 
-    if (top == 0 or r.modules.len == 0) return;
+    if (top == 0 or r.modules.len == 0) return r;
     const n = @min(@as(usize, top), r.modules.len);
     try out.print("\ntop {d} modules by bytecode\n", .{n});
     for (r.modules[0..n]) |m| {
         try out.print("  {d:>9}  {s}\n", .{ m.bytes, m.name });
     }
+    return r;
 }
 
 /// What the debug info section holds, for the bundles that carry one.
@@ -299,8 +303,11 @@ fn writeTreemap(
     out: *Io.Writer,
     b: Bundle,
     dest: []const u8,
+    attribution: ?modules.Result,
 ) !void {
-    const root = try tree.build(arena, b.header, b.functions, b.table, b.bytes.len, .{});
+    const root = try tree.build(arena, b.header, b.functions, b.table, b.bytes.len, .{
+        .attribution = attribution,
+    });
 
     const file = try Io.Dir.cwd().createFile(io, dest, .{});
     defer file.close(io);

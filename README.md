@@ -59,6 +59,7 @@ hbcinfo [options] <file> [file-b]
   --entry-b PATH same, for the second file in a diff
   --html PATH    write a treemap of the bundle to PATH as one html file
   --budget PATH  check section sizes against a budget file; over exits 1
+  --sourcemap P  attribute bytecode to modules using a composed source map
   --list         list the bundles in a container and exit
 ```
 
@@ -208,6 +209,63 @@ is the only honest option.
 The text diff refuses to compare bundles from the two bytecode lines, because
 their section tables do not line up. The treemap refuses the same comparison. A
 picture of a table the tool declined to print would be worse for being prettier.
+
+## Which modules cost what
+
+```sh
+hbcinfo --sourcemap composed.map app-release.aab
+```
+
+```
+modules
+  attributed        2184649 bytes across 1818 modules
+  unattributed      184 bytes with no mapping
+
+top 6 modules by bytecode
+    102847  /node_modules/expo/virtual/streams.js
+     84253  /node_modules/react-native/Libraries/Renderer/implementations/ReactNativeRenderer-prod.js
+     82127  /node_modules/react-native/Libraries/Renderer/implementations/ReactFabric-prod.js
+     38403  /node_modules/i18next/dist/esm/i18next.js
+     27976  /node_modules/css-tree/data/index.js
+     25175  /node_modules/react-native-pulsar/src/Presets.ts
+```
+
+Attribution reconciles with the section exactly: 2184649 attributed plus 184
+with no mapping is the 2184833 the section holds. With `--html` the bytecode
+section is drawn by package instead of by function, and a package opens into
+its files.
+
+![bytecode by package](docs/packages-treemap.png)
+
+The two lines at the top of that measurement are both React renderers, Fabric
+and the old one, together 166 KB of a 3.7 MB bundle.
+
+### What it needs, and what it does not
+
+**The source map, not the bundle's debug info.** Those two are mutually
+exclusive: `-output-source-map` is the same flag that strips the debug info,
+so a bundle never carries both. The map is the input, which means this works on
+a normally configured release build rather than a special one.
+
+It has to be the **composed** map, Metro's merged with Hermes's, which is what
+`compose-source-maps.js` produces and what a release uploads for symbolication.
+Handed Metro's JavaScript map alone, the tool says so instead of attributing
+bytes at random: that map's columns are characters of JavaScript, not bytes of
+bytecode.
+
+### Two things that are easy to get wrong
+
+**A function's position in the map is not where its body sits in the file.** It
+is the running sum of every function's size in index order. Hermes deduplicates
+identical bodies, so in the file several functions share one address, while the
+map gives each its own slot. Deriving one from the other by picking a base
+offset agrees for the first sixty-odd functions and then drifts.
+
+**Attribution has to be by byte range, not by function.** The global function of
+a Metro bundle is 58 KB spanning every module's wrapper. Giving all of it to
+whichever module happens to start it is wrong by more than everything else put
+together, and it is the difference between the totals reconciling and missing by
+58103 bytes.
 
 ## Budgets
 
