@@ -9,6 +9,8 @@ const tree = @import("tree.zig");
 const html = @import("html.zig");
 const budget = @import("budget.zig");
 const debug = @import("debug.zig");
+const sourcemap = @import("sourcemap.zig");
+const modules = @import("modules.zig");
 
 const usage =
     \\hbcinfo: Hermes bundle forensics
@@ -28,6 +30,7 @@ const usage =
     \\  --entry-b PATH same, for the second file in a diff
     \\  --html PATH    write a treemap of the bundle to PATH as one html file
     \\  --budget PATH  check section sizes against a budget file; over exits 1
+    \\  --sourcemap P  attribute bytecode to modules using a composed source map
     \\  --list         list the bundles in a container and exit
     \\
 ;
@@ -47,6 +50,8 @@ const Args = struct {
     html: ?[]const u8 = null,
     /// Budget file to check the bundle against; a breach exits non-zero.
     budget: ?[]const u8 = null,
+    /// Source map to attribute bytecode back to modules with.
+    sourcemap: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -84,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
         }
     } else {
         try report(out, a, args.top);
+        if (args.sourcemap) |mp| try reportModules(arena, io, out, a, mp, args.top);
         if (args.html) |dest| try writeTreemap(arena, io, out, a, dest);
     }
 
@@ -94,6 +100,51 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     try out.flush();
+}
+
+/// Attributes bytecode to the modules it came from, using the source map that
+/// shipped with the build.
+fn reportModules(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    b: Bundle,
+    path: []const u8,
+    top: u32,
+) !void {
+    const json = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(512 * 1024 * 1024)) catch |err| {
+        try out.print("\nerror: could not read source map {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+
+    const map = sourcemap.parse(arena, json) catch |err| {
+        try out.print("\nsource map {s}\n  unusable: {s}\n", .{ path, @errorName(err) });
+        if (err == error.NotAHermesMap) {
+            try out.print(
+                "  this looks like Metro's JavaScript map. The one that maps bytecode\n" ++
+                    "  is Metro's composed with Hermes's, which is what a release build\n" ++
+                    "  uploads for symbolication.\n",
+                .{},
+            );
+        }
+        return;
+    };
+
+    const r = try modules.attribute(arena, b.functions, map);
+
+    try out.print("\nmodules\n", .{});
+    try out.print("  source map        {s}\n", .{path});
+    try out.print("  attributed        {d} bytes across {d} modules\n", .{ r.attributed, r.modules.len });
+    if (r.unattributed > 0) {
+        try out.print("  unattributed      {d} bytes with no mapping\n", .{r.unattributed});
+    }
+
+    if (top == 0 or r.modules.len == 0) return;
+    const n = @min(@as(usize, top), r.modules.len);
+    try out.print("\ntop {d} modules by bytecode\n", .{n});
+    for (r.modules[0..n]) |m| {
+        try out.print("  {d:>9}  {s}\n", .{ m.bytes, m.name });
+    }
 }
 
 /// What the debug info section holds, for the bundles that carry one.
@@ -441,6 +492,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
     var path_b: ?[]const u8 = null;
     var html_out: ?[]const u8 = null;
     var budget_file: ?[]const u8 = null;
+    var map_file: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -457,6 +509,10 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
             i += 1;
             if (i >= argv.len) return null;
             entry_b = argv[i];
+        } else if (std.mem.eql(u8, a, "--sourcemap")) {
+            i += 1;
+            if (i >= argv.len) return null;
+            map_file = argv[i];
         } else if (std.mem.eql(u8, a, "--budget")) {
             i += 1;
             if (i >= argv.len) return null;
@@ -484,6 +540,7 @@ fn parseArgs(argv: []const [:0]const u8) ?Args {
         .entry = entry,
         .html = html_out,
         .budget = budget_file,
+        .sourcemap = map_file,
         .list = list,
         .path_b = path_b,
         .entry_b = entry_b,
