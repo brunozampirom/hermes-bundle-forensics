@@ -3,41 +3,17 @@
 `hbcinfo` reads a Hermes bytecode bundle, from an `.apk`, `.aab`, `.ipa` or a
 raw `.hbc`, and tells you where its bytes went.
 
-It found this on a real shipped app, comparing the Android and iOS artifacts of
-one build:
+It found this comparing the Android and iOS artifacts of one shipped app:
 
 ```
   debug info                         28      1722956   +1722928
 ```
 
-The iOS bundle is 1.93 MB larger than the Android one, and **1.72 MB of that is
-Hermes debug info the release build kept**.
-
-None of that is new behaviour, and this tool did not discover it. Sentry's
-[source map docs](https://docs.sentry.io/platforms/react-native/sourcemaps/uploading/hermes/)
-state the mechanism plainly: generating Hermes source maps "has a side effect of
-striping the debug information, saving it to the source map" (their typo), and
-"the debug information included in the Hermes bundle increases the size of the
-final shipped bundle". What was missing is any way to see how much, on your
-bundle. Metro reports one number per platform and stops there, so a documented
-cost stays invisible until something opens the file and counts.
-
-The cause is a default that differs by platform. `-output-source-map` moves the
-debug info out of the bundle and into the `.map`, and React Native passes it on
-one platform but not the other:
-
-| | flag | debug info in the shipped bundle |
-|---|---|---|
-| Android, `ReactExtension.kt` | `["-O", "-output-source-map"]`, always | 28 bytes |
-| iOS, `react-native-xcode.sh` | `-output-source-map` only when `SOURCEMAP_FILE` is set | everything |
-
-Compiling one file both ways with the same `hermesc` shows the mechanism
-directly: 208 bytes of debug info without the flag, 28 with it, and a `.map`
-alongside.
-
-So the fix is not to strip anything. Set `SOURCEMAP_FILE` in the iOS build and
-you get a source map for symbolication *and* drop the bytes, because Sentry and
-Crashlytics read the `.map`, not the section inside the bundle.
+The iOS bundle is 1.93 MB larger, and **1.72 MB of that is Hermes debug info the
+release build kept**. The behaviour is documented and this tool did not discover
+it; what was missing is any way to see how much, on your bundle. The mechanism,
+and why it is a platform default rather than anyone's mistake, is
+[further down](#why-ios-ships-debug-info-and-android-does-not).
 
 Measured on real store artifacts, the asymmetry holds across bytecode lines:
 
@@ -56,10 +32,40 @@ The third row is the one that matters. It is a template app created with
 anyone. This is not a misconfiguration in someone's project; it is what the
 default does.
 
-It is not universal, though. Anyone who follows the Sentry, Bugsnag or
-Crashlytics setup guides sets `SOURCEMAP_FILE` and is already on the other side
-of this. The affected set is iOS builds with no source map upload configured,
-which is the default rather than the exception.
+![treemap of the same comparison](docs/diff-treemap.png)
+
+Same data as the table above, from `hbcinfo --html`. Area is the iOS bundle,
+colour is the change against Android, and the section that should be 28 bytes is
+the second largest thing in the file.
+
+## Install
+
+Prebuilt binaries for linux, macOS and Windows, on x86_64 and aarch64, are on
+the [releases page](https://github.com/brunozampirom/hermes-bundle-forensics/releases).
+Each release ships a `SHA256SUMS` file.
+
+```sh
+tar -xzf hbcinfo-v0.1.0-aarch64-macos.tar.gz
+./hbcinfo-v0.1.0-aarch64-macos/hbcinfo app-release.aab
+```
+
+## Usage
+
+```
+hbcinfo [options] <file> [file-b]
+
+  --top N        list the N largest functions and strings (default 10, 0 skips)
+  --entry PATH   which bundle to read, when a container holds several
+  --entry-b PATH same, for the second file in a diff
+  --html PATH    write a treemap of the bundle to PATH as one html file
+  --budget PATH  check section sizes against a budget file; over exits 1
+  --list         list the bundles in a container and exit
+```
+
+Containers are detected by the `PK\x03\x04` signature, not by extension. A
+container holding several bundles (split APKs, multi-module AABs) is an error
+rather than a silent pick, since which one the numbers describe would otherwise
+be a guess.
 
 ## What it reports
 
@@ -150,34 +156,6 @@ Functions are matched by name, which only works for names unique to both
 bundles; the report says how many it could not match rather than pretending
 the rest vanished.
 
-## Install
-
-Prebuilt binaries for linux, macOS and Windows, on x86_64 and aarch64, are on
-the [releases page](https://github.com/brunozampirom/hermes-bundle-forensics/releases).
-Each release ships a `SHA256SUMS` file.
-
-```sh
-tar -xzf hbcinfo-v0.1.0-aarch64-macos.tar.gz
-./hbcinfo-v0.1.0-aarch64-macos/hbcinfo app-release.aab
-```
-
-## Usage
-
-```
-hbcinfo [options] <file> [file-b]
-
-  --top N        list the N largest functions and strings (default 10, 0 skips)
-  --entry PATH   which bundle to read, when a container holds several
-  --entry-b PATH same, for the second file in a diff
-  --html PATH    write a treemap of the bundle to PATH as one html file
-  --list         list the bundles in a container and exit
-```
-
-Containers are detected by the `PK\x03\x04` signature, not by extension. A
-container holding several bundles (split APKs, multi-module AABs) is an error
-rather than a silent pick, since which one the numbers describe would otherwise
-be a guess.
-
 ## The treemap
 
 ```sh
@@ -254,6 +232,39 @@ A name matching no section fails the run rather than passing quietly. A budget
 file that silently checks nothing because of a typo is the failure worth
 designing against, since it only shows up as the regression it was meant to
 catch.
+
+## Why iOS ships debug info and Android does not
+
+None of that is new behaviour, and this tool did not discover it. Sentry's
+[source map docs](https://docs.sentry.io/platforms/react-native/sourcemaps/uploading/hermes/)
+state the mechanism plainly: generating Hermes source maps "has a side effect of
+striping the debug information, saving it to the source map" (their typo), and
+"the debug information included in the Hermes bundle increases the size of the
+final shipped bundle". What was missing is any way to see how much, on your
+bundle. Metro reports one number per platform and stops there, so a documented
+cost stays invisible until something opens the file and counts.
+
+The cause is a default that differs by platform. `-output-source-map` moves the
+debug info out of the bundle and into the `.map`, and React Native passes it on
+one platform but not the other:
+
+| | flag | debug info in the shipped bundle |
+|---|---|---|
+| Android, `ReactExtension.kt` | `["-O", "-output-source-map"]`, always | 28 bytes |
+| iOS, `react-native-xcode.sh` | `-output-source-map` only when `SOURCEMAP_FILE` is set | everything |
+
+Compiling one file both ways with the same `hermesc` shows the mechanism
+directly: 208 bytes of debug info without the flag, 28 with it, and a `.map`
+alongside.
+
+So the fix is not to strip anything. Set `SOURCEMAP_FILE` in the iOS build and
+you get a source map for symbolication *and* drop the bytes, because Sentry and
+Crashlytics read the `.map`, not the section inside the bundle.
+
+It is not universal, though. Anyone who follows the Sentry, Bugsnag or
+Crashlytics setup guides sets `SOURCEMAP_FILE` and is already on the other side
+of this. The affected set is iOS builds with no source map upload configured,
+which is the default rather than the exception.
 
 ## Scope
 

@@ -320,7 +320,9 @@ const script =
     \\    const paint = fill(r.node, !!r.node.c);
     \\    el.style.background = paint[0];
     \\    el.style.color = paint[1];
-    \\    if (r.w > 60 && r.h > 26) {
+    \\    // A label is a name line plus a size line, and the name can wrap, so
+    \\    // a tile shorter than this shows a label cut in half.
+    \\    if (r.w > 70 && r.h > 36) {
     \\      el.classList.add('lbl');
     \\      el.innerHTML = '<b></b><i></i>';
     \\      el.querySelector('b').textContent = r.node.n;

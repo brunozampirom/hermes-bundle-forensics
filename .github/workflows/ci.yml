@@ -29,3 +29,19 @@ jobs:
       - run: zig build
       - run: zig build test --summary all
       - run: zig fmt --check src build.zig
+
+      # The help text and the README have drifted apart twice, each time in a
+      # different direction, and neither time did anything fail. Every option
+      # the binary accepts has to appear in the README's usage block.
+      - name: Assert the README documents every option
+        run: |
+          set -eu
+          ./zig-out/bin/hbcinfo > help.txt 2>&1 || true
+          missing=0
+          for flag in $(grep -oE '^\s+--[a-z-]+' help.txt | tr -d ' '); do
+            if ! grep -q -- "$flag" README.md; then
+              echo "$flag is in the help text but not in the README"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
