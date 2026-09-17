@@ -352,9 +352,9 @@ since Hermes V1 became the default it ships the `static_h` line, which emits
 
 That 8-bit name field has a visible consequence: any function whose name is not
 in the first 256 strings cannot fit inline, so on a real bundle almost every
-header overflows. On the React Native bundle measured below, 6667 of 7482 did,
-and the full size headers they point at are 12.9% of the file. They get their
-own row rather than disappearing into the remainder.
+header overflows. On a React Native bundle 6667 of 7482 did, and the full size
+headers they point at were 12.9% of the file. They get their own row rather
+than disappearing into the remainder.
 
 Below 90, fields are missing from the header; the tool refuses rather than
 reading garbage.
@@ -366,9 +366,10 @@ up and a row would be labelled from one side and filled from the other.
 To get a 96 bundle out of a recent React Native, build with
 `RCT_HERMES_V1_ENABLED=0`.
 
-**What it does not do:** attribute bytes back to JS modules. Hermes keeps no
-module boundary in the bytecode, so anything module-level would have to come
-from a Metro source map, which is a different tool.
+**Module attribution needs the source map.** Hermes keeps no module boundary in
+the bytecode, so `--sourcemap` is not a convenience: without the composed map
+there is nothing in the file to attribute against, and the tool reports
+sections and functions only.
 
 ## Build from source
 
