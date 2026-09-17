@@ -349,12 +349,17 @@ since Hermes V1 became the default it ships the `static_h` line, which emits
 | function header entry | 16 bytes | 12 bytes; the word holding `infoOffset` is gone |
 | inline function name | 17 bits | **8 bits** |
 | overflow offset | `(infoOffset << 16) \| offset` | `(functionName << 24) \| offset` |
+| debug info header | 7 words | **4**; no scope data, textified callees or debugger string table, and none of the fields that located them |
 
 That 8-bit name field has a visible consequence: any function whose name is not
-in the first 256 strings cannot fit inline, so on a real bundle almost every
-header overflows. On a React Native bundle 6667 of 7482 did, and the full size
-headers they point at were 12.9% of the file. They get their own row rather
-than disappearing into the remainder.
+in the first 256 strings cannot fit inline, so most headers on a real bundle
+overflow. On a 36 MB production bundle of 116846 functions, 78147 did, and the
+full size headers they point at are 7.6% of the file. They get their own row
+rather than disappearing into the remainder.
+
+Compiling the same sources with debug info pushes that to 102189, which costs a
+further 865 KB of headers on top of the debug section itself. The debug info a
+bundle carries is not only the size of its own section.
 
 Below 90, fields are missing from the header; the tool refuses rather than
 reading garbage.
@@ -370,6 +375,29 @@ To get a 96 bundle out of a recent React Native, build with
 the bytecode, so `--sourcemap` is not a convenience: without the composed map
 there is nothing in the file to attribute against, and the tool reports
 sections and functions only.
+
+### What it has been run against
+
+Version support and having been run are different claims, so here is the second
+one. Two production React Native apps, one per bytecode line:
+
+| | bytecode | functions | size | through |
+|---|---|---|---|---|
+| a shipped app | 96, classic | 19360 / 19389 | 3.8 MB Android, 5.8 MB iOS | the `.aab` and `.ipa` off the store build |
+| a larger app | 98 and 99, `static_h` | 116846 | 36 to 44 MB | `expo export:embed` then `hermesc`, with and without `-output-source-map` |
+
+The checks that make those runs mean something are arithmetic the bundle has to
+satisfy, not eyeballing the output. Sections sum inside the file. Per-section
+deltas between two builds of identical sources sum to the exact difference in
+file size. Every parent in the treemap equals the sum of its children.
+Attributed plus unattributed bytes equal the bytecode section exactly. The
+debug walk lands on the record boundary rather than near it.
+
+Those are worth stating because the second app broke three of them, and each
+break was a real bug: the `static_h` debug header is four words and was read as
+seven, the top functions listing sorted the caller's slice and corrupted the
+module attribution that ran after it, and the section total was a leftover
+subtraction that could not fail. The first app had passed all three.
 
 ## Build from source
 
